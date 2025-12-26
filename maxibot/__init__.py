@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Optional, Callable, Union
 from maxibot.apihelper import Api
 from maxibot.types import Message, CallbackQuery, InputMedia
 from maxibot.types import UpdateType, InlineKeyboardMarkup
-from maxibot.util import extract_command, get_text, get_parce_mode
+from maxibot.util import extract_command, get_text, get_parse_mode
 from maxibot.core.attachments.photo import Photo
 from maxibot.core.network.polling import Polling
 
@@ -413,7 +413,7 @@ class MaxiBot:
         chat_id: Union[str, int],
         message_id: str,
         reply_markup: Union[InlineKeyboardMarkup, Any] = None,
-        parce_mode: Union[str, Any] = None
+        parse_mode: Union[str, Any] = None
     ):
         """
         Метод изменения текстового сообщения `message_id` в чате `chat_id`
@@ -438,7 +438,7 @@ class MaxiBot:
             text=text,
             method="PUT",
             attachments=final_attachments,
-            parse_mode=parce_mode
+            parse_mode=parse_mode
         )
         return {}
 
@@ -448,7 +448,7 @@ class MaxiBot:
         chat_id: Union[str, int],
         message_id: str,
         reply_markup: Union[InlineKeyboardMarkup, Any] = None,
-        parce_mode: Union[str, Any] = "markdown"
+        parse_mode: Union[str, Any] = "markdown"
     ):
         """
         Метод изменения медиа сообщения `message_id` в чате `chat_id`
@@ -475,13 +475,13 @@ class MaxiBot:
             else:
                 final_attachments.append(reply_markup)
         text = get_text(media=media)
-        parce_mode = get_parce_mode(media=media, parse_mode=parce_mode)
+        parse_mode = get_parse_mode(media=media, parse_mode=parse_mode)
         self.api.send_message(
             msg_id=message_id,
             text=text,
             method="PUT",
             attachments=final_attachments,
-            parse_mode=parce_mode
+            parse_mode=parse_mode
         )
         return {}
 
@@ -490,7 +490,7 @@ class MaxiBot:
         chat_id: Union[str, int],
         message_id: str,
         reply_markup: Union[InlineKeyboardMarkup, Any] = None,
-        parce_mode: Union[str, Any] = "markdown"
+        parse_mode: Union[str, Any] = "markdown"
     ):
         """
         Метод изменения клавиатуры сообщения `message_id` в чате `chat_id`
@@ -517,7 +517,7 @@ class MaxiBot:
             msg_id=message_id,
             method="PUT",
             attachments=final_attachments,
-            parse_mode=parce_mode.lower()
+            parse_mode=parse_mode.lower()
         )
         return {}
 
@@ -527,7 +527,7 @@ class MaxiBot:
         text: str,
         attachments: Optional[List[Dict[str, Any]]] = None,
         reply_markup: Optional[Any] = None,
-        parce_mode: str = "markdown",
+        parse_mode: str = "markdown",
         notify: bool = True
     ) -> Message:
         """
@@ -564,7 +564,7 @@ class MaxiBot:
                 chat_id=chat_id,
                 text=text,
                 attachments=final_attachments,
-                parse_mode=parce_mode.lower(),
+                parse_mode=parse_mode.lower(),
                 notify=notify
             ),
             api=self.api

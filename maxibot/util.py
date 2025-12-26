@@ -83,7 +83,7 @@ def get_text(media):
         return text
 
 
-def get_parce_mode(media, parse_mode: str):
+def get_parse_mode(media, parse_mode: str):
     """
     Метод получения parce_mode из media
 

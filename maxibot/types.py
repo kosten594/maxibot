@@ -1,9 +1,18 @@
-from dataclasses import dataclass
+# from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 from maxibot.apihelper import Api
 from maxibot.util import is_pil_image, pil_image_to_bytes
+
+
+class JsonDeserializable(object):
+    def __str__(self):
+        d = {
+            x: y.__dict__ if hasattr(y, '__dict__') else y
+            for x, y in self.__dict__.items()
+        }
+        return str(d)
 
 
 class UpdateType:
@@ -173,7 +182,7 @@ class InlineKeyboardMarkup:
                 )
 
 
-class ImagePayload:
+class ImagePayload(JsonDeserializable):
     """
     Класс для хранения данных изображения
 
@@ -187,7 +196,7 @@ class ImagePayload:
         self.url = payload.get("url")
 
 
-class ImageAttachment:
+class ImageAttachment(JsonDeserializable):
     """
     Класс для работы с вложениями типа "image"
 
@@ -216,7 +225,7 @@ class ImageAttachment:
         }
 
 
-class Recipient:
+class Recipient(JsonDeserializable):
     """
     Класс получателя сообщения
 
@@ -230,7 +239,7 @@ class Recipient:
         self.user_id = rec.get("user_id")
 
 
-class Body:
+class Body(JsonDeserializable):
     """
     Класс тела сообщения
 
@@ -245,7 +254,7 @@ class Body:
         self.attachments = body.get("attachments")
 
 
-class User:
+class User(JsonDeserializable):
     """
     Класс пользователя
 
@@ -280,7 +289,7 @@ class User:
             self.language_code = update.get("user_locale")
 
 
-class Chat:
+class Chat(JsonDeserializable):
     """
     Класс чата
 
@@ -299,7 +308,7 @@ class Chat:
             self.user_id = update.get("message").get("recipient").get("user_id")
 
 
-class ChatLink:
+class ChatLink(JsonDeserializable):
     """
     Класс ссылки на чат
 
@@ -311,7 +320,7 @@ class ChatLink:
         self.id = update.get("chat_id")
 
 
-class Link:
+class Link(JsonDeserializable):
     """
     Класс ссылки на сообщение
 
@@ -327,7 +336,7 @@ class Link:
             self.chat: ChatLink = ChatLink(update=link)
 
 
-class Photo:
+class Photo(JsonDeserializable):
     """
     Класс для работы с фотографиями
 
@@ -345,7 +354,7 @@ class Photo:
                     self.url: str = att.get("payload").get("url")
 
 
-class InputMedia:
+class InputMedia(JsonDeserializable):
     """
     Класс формирования объекта attachments для отправки медиа
 
@@ -435,7 +444,7 @@ class InputMedia:
         }
 
 
-class InputMediaPhoto(InputMedia):
+class InputMediaPhoto(InputMedia, JsonDeserializable):
     """
     Класс для отправки фотографий
 
@@ -453,7 +462,7 @@ class InputMediaPhoto(InputMedia):
         super().__init__(type="photo", media=media, caption=caption, parse_mode=parse_mode)
 
 
-class InputMediaVideo(InputMedia):
+class InputMediaVideo(InputMedia, JsonDeserializable):
     """
     Класс для отправки видео
 
@@ -471,7 +480,7 @@ class InputMediaVideo(InputMedia):
         super().__init__(type="video", media=media, caption=caption, parse_mode=parse_mode)
 
 
-class Message:
+class Message(JsonDeserializable):
     """
     Класс для работы с сообщениями (аналог telebot.types.Message)
 

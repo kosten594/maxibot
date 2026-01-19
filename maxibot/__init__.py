@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 import traceback
 
 from typing import Dict, Any, List, Optional, Callable, Union
@@ -386,6 +387,7 @@ class MaxiBot:
                 parse_mode=parse_mode.lower()
             )
             if isinstance(response, str):
+                time.sleep(1)
                 continue
             break
         return Message(update=response, api=self.api)

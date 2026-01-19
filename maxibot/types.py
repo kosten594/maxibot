@@ -263,7 +263,9 @@ class User(JsonDeserializable):
     """
 
     def __init__(self, update: Dict[str, Any]):
-        if update.get("callback"):
+        if not isinstance(update, dict):
+            pass
+        elif update.get("callback"):
             self.id = update.get("message").get("recipient").get("chat_id")
             self.real_id = update.get("callback").get("user").get("user_id")
             self.is_bot = update.get("callback").get("user").get("is_bot")

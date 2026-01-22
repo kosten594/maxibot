@@ -274,7 +274,7 @@ class User(JsonDeserializable):
             self.username = update.get("callback").get("user").get("name")
             self.last_name = update.get("callback").get("user").get("last_name")
             self.language_code = update.get("user_locale")
-        elif update.get("update_type") == UpdateType.BOT_STARTED:
+        elif update.get("update_type") == UpdateType.BOT_STARTED or update.get("update_type") == UpdateType.BOT_ADDED:
             self.id = update.get("chat_id")
             self.real_id = update.get("user").get("user_id")
             self.is_bot = update.get("user").get("is_bot")
@@ -301,7 +301,7 @@ class Chat(JsonDeserializable):
     """
 
     def __init__(self, update: Dict[str, Any]):
-        if update.get("update_type") == UpdateType.BOT_STARTED:
+        if update.get("update_type") == UpdateType.BOT_STARTED or update.get("update_type") == UpdateType.BOT_ADDED:
             self.id = update.get("chat_id")
             self.type = None
             self.user_id = None

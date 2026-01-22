@@ -1,5 +1,5 @@
 import asyncio
-import json
+# import json
 import re
 import time
 import traceback
@@ -10,7 +10,7 @@ from maxibot.apihelper import Api
 from maxibot.types import Message, CallbackQuery, InputMedia
 from maxibot.types import UpdateType, InlineKeyboardMarkup
 from maxibot.util import extract_command, get_text, get_parse_mode
-from maxibot.core.attachments.photo import Photo
+# from maxibot.core.attachments.photo import Photo
 from maxibot.core.network.polling import Polling
 
 HandlerFunc = Callable[[Message], None]

@@ -537,7 +537,10 @@ class Message(JsonDeserializable):
             else:
                 return "text"
         except Exception:
-            return "text"
+            if update.get("update_type") == UpdateType.BOT_ADDED:
+                return UpdateType.BOT_ADDED
+            else:
+                return "text"
 
     @staticmethod
     def _get_msg_id(update: Dict[str, Any]) -> Optional[str]:

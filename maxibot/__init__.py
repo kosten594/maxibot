@@ -104,6 +104,7 @@ class MaxiBot:
         regexp: Optional[str] = None,
         func: Optional[Callable] = None,
         content_types: Optional[List[str]] = None,
+        chat_types: Optional[List[str]] = None
     ):
         """
         Декоратор для регистрации обработчика текстовых сообщений по шаблону
@@ -117,7 +118,8 @@ class MaxiBot:
                 commands=commands,
                 regexp=regexp,
                 func=func,
-                content_types=content_types
+                content_types=content_types,
+                chat_types=chat_types
             )
             self.message_handlers.append(handler_dict)
             return funcs
@@ -154,8 +156,8 @@ class MaxiBot:
             return re.search(filter_value, text, re.IGNORECASE)
         elif message_filter == 'commands':
             return extract_command(text) in filter_value
-        # elif message_filter == 'chat_types':
-        #     return context.chat.type in filter_value
+        elif message_filter == 'chat_types':
+            return context.chat.type in filter_value
         elif message_filter == 'func':
             # print("FUUUUUUUUUUUUUUUUUUUUUUUUNCCCCCCCCCCCCCCCCC")
             return filter_value(context)

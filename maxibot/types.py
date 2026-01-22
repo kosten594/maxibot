@@ -302,7 +302,12 @@ class Chat(JsonDeserializable):
 
     def __init__(self, update: Dict[str, Any], api: Api):
         self.api = api
-        if update.get("update_type") == UpdateType.BOT_STARTED or update.get("update_type") == UpdateType.BOT_ADDED:
+        if update.get("update_type") == UpdateType.BOT_STARTED:
+            self.id = update.get("chat_id")
+            self.title = self.get_chat_title(chat_id=self.id)
+            self.type = "dialog"
+            self.user_id = None
+        elif update.get("update_type") == UpdateType.BOT_ADDED:
             self.id = update.get("chat_id")
             self.title = self.get_chat_title(chat_id=self.id)
             self.type = None

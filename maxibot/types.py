@@ -25,6 +25,7 @@ class UpdateType:
     MESSAGE_EDITED = "message_edited"
     MESSAGE_DELETED = "message_deleted"
     MESSAGE_CHAT_CREATED = "message_chat_created"
+    BOT_ADDED = "bot_added"
 
 
 class InlineKeyboardButton:

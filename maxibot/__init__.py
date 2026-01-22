@@ -223,7 +223,7 @@ class MaxiBot:
 
             update_type = update.get("update_type")
             if update_type == UpdateType.MESSAGE_CREATED and "message" in update.keys() or \
-               update_type == UpdateType.BOT_STARTED:
+               update_type == UpdateType.BOT_STARTED or update_type == UpdateType.BOT_ADDED:
                 context = Message(update, self.api)
                 self._process_text_message(context)
             elif update_type == UpdateType.MESSAGE_CALLBACK:

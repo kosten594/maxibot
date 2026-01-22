@@ -300,15 +300,28 @@ class Chat(JsonDeserializable):
     :type update: Dict[str, Any]
     """
 
-    def __init__(self, update: Dict[str, Any]):
+    def __init__(self, update: Dict[str, Any], api: Api):
+        self.api = api
         if update.get("update_type") == UpdateType.BOT_STARTED or update.get("update_type") == UpdateType.BOT_ADDED:
             self.id = update.get("chat_id")
+            self.title = self.get_chat_title(chat_id=self.id)
             self.type = None
             self.user_id = None
         else:
             self.id = update.get("message").get("recipient").get("chat_id")
+            self.title = self.get_chat_title(chat_id=self.id)
             self.type = update.get("message").get("recipient").get("chat_type")
             self.user_id = update.get("message").get("recipient").get("user_id")
+
+    def get_chat_title(self, chat_id: str):
+        """
+        Получение заголовка чата
+
+        :param chat_id: айди чата
+        :type chat_id: Dict[str, Any]
+        """
+        info = self.api.get_chat_info(chat_id=chat_id)
+        return info.get("title")
 
 
 class ChatLink(JsonDeserializable):
@@ -615,7 +628,7 @@ class Message(JsonDeserializable):
             self.message_id: Optional[str] = self._get_msg_id(update=update)
             self.from_user: Optional[User] = User(update=update)
             self.date: Optional[datetime] = self._get_msg_timestamp(update=update)
-            self.chat: Chat = Chat(update=update)
+            self.chat: Chat = Chat(update=update, api=api)
             self.reply_to_message: Link = Link(link=update.get("message", {}).get("link", None))
             self.text: Optional[str] = self._get_msg_text(update=update)
             self.photo: Optional[ImageAttachment] = self._get_photo_from_attachments(update=update)

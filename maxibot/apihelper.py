@@ -134,6 +134,15 @@ class Api:
         """
         return self.client.request("GET", "/me")
 
+    def leave_chat(self, chat_id: str):
+        """
+        Апи метод для получения информации о боте
+
+        :return: Json
+        :rtype: Dict[str: Any]
+        """
+        return self.client.request("GET", f"/chats/{chat_id}/me")
+
     def load_file(self, url: str, files: Dict, content_types: str = None):
         """
         Апи метод для получения url загрузки файла.

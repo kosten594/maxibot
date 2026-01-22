@@ -591,7 +591,13 @@ class MaxiBot:
         Метод получения информации о боте
         """
         info = self.api.get_bot_info()
-        print(info)
+        return info
+
+    def leave_chat(self, chat_id: str):
+        """
+        Метод получения информации о боте
+        """
+        return self.api.leave_chat(chat_id=chat_id)
 
     def callback_query_handler(self, data=None, **kwargs):
         """

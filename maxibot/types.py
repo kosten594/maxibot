@@ -615,7 +615,7 @@ class Message(JsonDeserializable):
         if update.get("message", {}).get("body", None):
             return update.get("message").get("body").get("text")
         elif update.get("update_type") == UpdateType.BOT_STARTED:
-            return "/start" + update.get("payload", "")
+            return "/start" + " " + update.get("payload", "")
         else:
             return None
 

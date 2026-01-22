@@ -115,15 +115,24 @@ class Api:
 
     def get_chat_info(self, chat_id: str):
         """
-        Апи метод для получения url загрузки файла.
+        Апи метод для получения инфомрации о чате.
 
-        :param type_attach: Тип файла, который требуется загрузить
-        :type type_attach: str
+        :param chat_id: Айди чата
+        :type chat_id: str
 
-        :return: Json с url для загрузки файла
+        :return: Json
         :rtype: Dict[str: Any]
         """
         return self.client.request("GET", f"/chats/{chat_id}")
+
+    def get_bot_info(self):
+        """
+        Апи метод для получения информации о боте
+
+        :return: Json
+        :rtype: Dict[str: Any]
+        """
+        return self.client.request("GET", "/me")
 
     def load_file(self, url: str, files: Dict, content_types: str = None):
         """

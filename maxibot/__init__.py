@@ -586,6 +586,13 @@ class MaxiBot:
         update["message"] = msg
         return Message(update=update, api=self.api)
 
+    def get_me(self):
+        """
+        Метод получения информации о боте
+        """
+        info = self.api.get_bot_info()
+        print(info)
+
     def callback_query_handler(self, data=None, **kwargs):
         """
         Декоратор для регистрации обработчиков callback-запросов от inline-кнопок

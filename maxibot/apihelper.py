@@ -113,6 +113,18 @@ class Api:
         """
         return self.client.request("POST", f"/uploads?type={type_attach}")
 
+    def get_chat_info(self, chat_id: str):
+        """
+        Апи метод для получения url загрузки файла.
+
+        :param type_attach: Тип файла, который требуется загрузить
+        :type type_attach: str
+
+        :return: Json с url для загрузки файла
+        :rtype: Dict[str: Any]
+        """
+        return self.client.request("GET", f"/chats/{chat_id}")
+
     def load_file(self, url: str, files: Dict, content_types: str = None):
         """
         Апи метод для получения url загрузки файла.

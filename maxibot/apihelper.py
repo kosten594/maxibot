@@ -141,7 +141,7 @@ class Api:
         :return: Json
         :rtype: Dict[str: Any]
         """
-        return self.client.request("GET", f"/chats/{chat_id}/me")
+        return self.client.request("DELETE", f"/chats/{chat_id}/members/me")
 
     def load_file(self, url: str, files: Dict, content_types: str = None):
         """

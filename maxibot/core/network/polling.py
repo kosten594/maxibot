@@ -25,6 +25,7 @@ class Polling:
         self.allowed_updates = allowed_updates
         self.is_running = False
         self.marker = None
+        self.is_prev_add = False
 
     def stop(self):
         """
@@ -50,7 +51,10 @@ class Polling:
                 updates = updates_data.get("updates", [])
                 for update in updates:
                     try:
-                        handler(update)
+                        if update.get("update_type") == "bot_added" and self.is_prev_add:
+                            continue
+                        else:
+                            handler(update)
                     except Exception:
                         print(f"Error handling update {traceback.format_exc()}")
 

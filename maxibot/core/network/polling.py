@@ -54,6 +54,10 @@ class Polling:
                         if update.get("update_type") == "bot_added" and self.is_prev_add:
                             continue
                         else:
+                            if update.get("update_type") == "bot_added":
+                                self.is_prev_add = True
+                            else:
+                                self.is_prev_add = False
                             handler(update)
                     except Exception:
                         print(f"Error handling update {traceback.format_exc()}")

@@ -4,6 +4,7 @@ import re
 import time
 import traceback
 
+from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Callable, Union
 
 from maxibot.apihelper import Api
@@ -14,6 +15,13 @@ from maxibot.util import extract_command, get_text, get_parse_mode
 from maxibot.core.network.polling import Polling
 
 HandlerFunc = Callable[[Message], None]
+
+@dataclass
+class StepHandler:
+    callback: Callable
+    args: tuple
+    kwargs: dict
+    timestamp: float
 
 
 class MaxiBot:
@@ -41,6 +49,7 @@ class MaxiBot:
         self.poll = None
         self.is_running = False
         self.count_retries = 10
+        self._next_steps: Dict[int, StepHandler] = {}
 
     @staticmethod
     def _build_handler_dict(handler: HandlerFunc, **filters):
@@ -225,7 +234,11 @@ class MaxiBot:
             if update_type == UpdateType.MESSAGE_CREATED and "message" in update.keys() or \
                update_type == UpdateType.BOT_STARTED or update_type == UpdateType.BOT_ADDED:
                 context = Message(update, self.api)
-                self._process_text_message(context)
+                if context.from_user.id in self._next_steps:
+                    handler = self._next_steps.pop(context.from_user.id)
+                    handler.callback(context, *handler.args, **handler.kwargs)
+                else:
+                    self._process_text_message(context)
             elif update_type == UpdateType.MESSAGE_CALLBACK:
                 print("Processing message_callback...")
                 if "callback" in update:
@@ -240,6 +253,29 @@ class MaxiBot:
         Проверки длины строки
         """
         return text is not None and not (len(text) < 4000)
+
+    def register_next_step_handler(self, message: Message, callback: Callable, *args, **kwargs):
+        """
+        Регистрирует функцию обратного вызова для получения уведомления о поступлении нового сообщения после `message`.
+
+        Предупреждение: Если `callback` используется как лямбда-функция,
+        сохранение обработчиков следующего шага работать не будет.
+
+        :param message: Объект сообщения
+        :type message: Message
+        :param callback: Функция обратного вызова
+        :type callback: Callable
+        :param args:
+        :param kwargs:
+        """
+
+        handler = StepHandler(
+            callback=callback,
+            args=args,
+            kwargs=kwargs,
+            timestamp=time.time()
+        )
+        self._next_steps[message.from_user.id] = handler
 
     def send_photo(
         self,

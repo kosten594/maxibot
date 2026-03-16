@@ -36,13 +36,13 @@
     * **caption** - Текст сообщения под фото  
     * **parse_mode** - Формат сообщения  
     * **reply_markup** - Объект клавиатуры  
-* **send_media_group** (`chat_id`, `media`, `caption`, `parse_mode`, `reply_markup`) - Отправляет сообщение с фото  
+* **send_media_group** (`chat_id`, `media`, `caption`, `parse_mode`, `reply_markup`) - Отправляет сообщение с группой медиафайлов  
     * **chat_id** - Чат, куда надо отправить сообщение  
     * **media** - Список объектов медиа  
     * **caption** - Текст сообщения под фото  
     * **parse_mode** - Формат сообщения  
     * **reply_markup** - Объект клавиатуры  
-* **send_document** (`chat_id`, `document`, `caption`, `parse_mode`, `reply_markup`) - Отправляет сообщение с фото  
+* **send_document** (`chat_id`, `document`, `caption`, `parse_mode`, `reply_markup`) - Отправляет сообщение с документом  
     * **chat_id** - Чат, куда надо отправить сообщение  
     * **document** - Объект документа  
     * **caption** - Текст сообщения под фото  
@@ -52,24 +52,24 @@
 * **send_document** (`chat_id`, `message_id`) - Метод удаления сообщения `message_id` в чате `chat_id`  
     * **chat_id** - Чат, куда надо отправить сообщение  
     * **message_id** - Уникальный идентификаторсообщения   
-* **edit_message_text** (`text`, `chat_id`, `message_id`, `parse_mode`, `reply_markup`) - Отправляет сообщение с фото  
+* **edit_message_text** (`text`, `chat_id`, `message_id`, `parse_mode`, `reply_markup`) - Редактирует текст сообщения  
     * **text** - Текст, на который надо заменить текущий  
     * **chat_id** - Чат, где надо изменить сообщение  
     * **message_id** - Идентификатор сообщения, которое надо поменять  
     * **parse_mode** - Формат сообщения  
     * **reply_markup** - Объект клавиатуры  
-* **edit_message_media** (`media`, `chat_id`, `message_id`, `parse_mode`, `reply_markup`) - Отправляет сообщение с фото  
+* **edit_message_media** (`media`, `chat_id`, `message_id`, `parse_mode`, `reply_markup`) - Редактирует сообщение с медиа  
     * **media** - Медиа, на которое надо заменить текущее  
     * **chat_id** - Чат, где надо изменить сообщение  
     * **message_id** - Идентификатор сообщения, которое надо поменять  
     * **parse_mode** - Формат сообщения  
     * **reply_markup** - Объект клавиатуры  
-* **edit_message_reply_markup** (`chat_id`, `message_id`, `parse_mode`, `reply_markup`) - Отправляет сообщение с фото  
+* **edit_message_reply_markup** (`chat_id`, `message_id`, `parse_mode`, `reply_markup`) - Редактирует клавиатуру сообщения  
     * **chat_id** - Чат, где надо изменить сообщение  
     * **message_id** - Идентификатор сообщения, которое надо поменять  
     * **parse_mode** - Формат сообщения  
     * **reply_markup** - Объект клавиатуры  
-* **send_message** (`chat_id`, `text`, `attachments`, `parse_mode`, `reply_markup`, `notify`) - Отправляет сообщение с фото  
+* **send_message** (`chat_id`, `text`, `attachments`, `parse_mode`, `reply_markup`, `notify`) - Отправляет сообщение  
     * **chat_id** - Чат, где надо изменить сообщение  
     * **text** - Текст сообщения  
     * **attachments** - Вложения сообщения  

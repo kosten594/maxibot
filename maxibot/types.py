@@ -47,14 +47,14 @@ class InlineKeyboardButton:
             self,
             text: str,
             url: Optional[str] = None,
-            callback_data: Optional[str] = None,
+            callback_data: Optional[str] = None
     ):
         self.text = text
         self.url = url
         self.callback_data = callback_data
 
-        if not (url or callback_data):
-            raise ValueError("url или callback_data обязан быть")
+        # if not (url or callback_data):
+        #     raise ValueError("url или callback_data обязан быть")
         if url and callback_data:
             raise ValueError("укажите что-то одно")
         if url and len(url) > self.MAX_URL_LEN:
@@ -83,6 +83,37 @@ class InlineKeyboardButton:
         :rtype: bool
         """
         return self.url is not None  # link
+
+
+class InlineKeyboardButtonRequestContact:
+    """
+    Класс для создания inline-кнопки запроса контактных данных пользователя
+
+    :param text: Текст на кнопке
+    """
+    def __init__(
+            self,
+            text: str
+    ):
+        self.text = text
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Преобразует кнопку в словарь для отправки в MAX API
+
+        :return: Словарь с данными кнопки в формате MAX API
+        :rtype: Dict[str, Any]
+        """
+        return {"type": "request_contact", "text": self.text}
+
+    def is_special(self) -> bool:
+        """
+        Проверяет, является ли кнопка специальной (ограничивает ряд до 3 кнопок)
+
+        :return: True если кнопка специальная (link), False если обычная (callback)
+        :rtype: bool
+        """
+        return False
 
 
 class InlineKeyboardMarkup:

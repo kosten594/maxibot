@@ -116,6 +116,38 @@ class InlineKeyboardButtonRequestContact:
         return False
 
 
+class InlineKeyboardButtonOpenApp:
+    """
+    Класс для создания inline-кнопки запуска miniapp
+
+    :param text: Текст на кнопке
+    :param web_app: Публичное имя (username) бота или ссылка на него, чьё мини-приложение надо запустить
+    :param payload: Параметр запуска, который будет передан в initData мини-приложения
+    """
+    def __init__(self, text, web_app, payload=None):
+        self.text = text
+        self.web_app = web_app
+        self.payload = payload
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Преобразует кнопку в словарь для отправки в MAX API
+
+        :return: Словарь с данными кнопки в формате MAX API
+        :rtype: Dict[str, Any]
+        """
+        return {"type": "open_app", "text": self.text, "web_app": self.web_app, "payload": self.payload}
+
+    def is_special(self) -> bool:
+        """
+        Проверяет, является ли кнопка специальной (ограничивает ряд до 3 кнопок)
+
+        :return: True если кнопка специальная (link), False если обычная (callback)
+        :rtype: bool
+        """
+        return False
+
+
 class InlineKeyboardMarkup:
     """
     Класс для создания inline-клавиатур в сообщениях

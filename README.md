@@ -9,7 +9,10 @@
 [![PyPi downloads](https://img.shields.io/pypi/dm/maxibot.svg)](https://pypi.org/project/maxibot/)
 [![PyPi status](https://img.shields.io/pypi/status/maxibot.svg?style=flat-square)](https://pypi.python.org/pypi/maxibot)
 
-### **Канал связи с разработчиками:** [t.me/maxibot_dev](https://t.me/maxibot_dev)
+### **Канал связи с разработчиками:** 
+max: [Чат в Макс](https://max.ru/join/fCUIMAwLGdO_F1BY4rTdHQ54_D8PaZyjLnc7CdcW8gY)
+
+tg: [t.me/maxibot_dev](https://t.me/maxibot_dev)
 
 ## Быстрый старт
 Необходимо установить библиотеку  

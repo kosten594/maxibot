@@ -92,6 +92,8 @@ class Api:
 
         if attachments:
             data["attachments"] = attachments
+        else:
+            data["attachments"] = []
 
         if parse_mode:
             data["format"] = parse_mode
@@ -261,8 +263,8 @@ class Api:
         if notification is not None:
             data["notification"] = notification
 
-        print(f"Answer params: {params}")
-        print(f"Answer data: {data}")
+        # print(f"Answer params: {params}")
+        # print(f"Answer data: {data}")
 
         # Если data пустой, отправляем пустой объект
         if not data:

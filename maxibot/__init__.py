@@ -10,11 +10,13 @@ from typing import Dict, Any, List, Optional, Callable, Union
 from maxibot.apihelper import Api
 from maxibot.types import Message, CallbackQuery, InputMedia
 from maxibot.types import UpdateType, InlineKeyboardMarkup
-from maxibot.util import extract_command, get_text, get_parse_mode
+from maxibot.util import extract_command, get_text, get_parse_mode, get_edit_message_data
 # from maxibot.core.attachments.photo import Photo
 from maxibot.core.network.polling import Polling
 
+
 HandlerFunc = Callable[[Message], None]
+
 
 @dataclass
 class StepHandler:
@@ -466,20 +468,31 @@ class MaxiBot:
 
         :param message_id: Айди сообщения
         :type message_id: int
+
+        :return: Информация об отправленном сообщении
+        :rtype: Message | {} (не успех)
         """
         final_attachments = []
+
         if reply_markup:
             if hasattr(reply_markup, 'to_attachment'):
                 final_attachments.append(reply_markup.to_attachment())
             else:
                 final_attachments.append(reply_markup)
-        self.api.send_message(
+
+        response = self.api.send_message(
             msg_id=message_id,
             text=text,
             method="PUT",
             attachments=final_attachments,
             parse_mode=parse_mode
         )
+
+        if isinstance(response, dict) and response.get("success"):
+            timestamp = int(time.time() * 1000)
+            message_data = get_edit_message_data(text, chat_id, message_id, final_attachments, timestamp)
+            return Message(update=message_data, api=self.api)
+
         return {}
 
     def edit_message_media(
@@ -501,6 +514,9 @@ class MaxiBot:
 
         :param message_id: Айди сообщения
         :type message_id: int
+
+        :return: Информация об отправленном сообщении
+        :rtype: Message | {} (не успех)
         """
         final_attachments = []
         # if isinstance(media, Photo):
@@ -516,13 +532,20 @@ class MaxiBot:
                 final_attachments.append(reply_markup)
         text = get_text(media=media)
         parse_mode = get_parse_mode(media=media, parse_mode=parse_mode)
-        self.api.send_message(
+
+        response = self.api.send_message(
             msg_id=message_id,
             text=text,
             method="PUT",
             attachments=final_attachments,
             parse_mode=parse_mode
         )
+
+        if isinstance(response, dict) and response.get("success"):
+            timestamp = int(time.time() * 1000)
+            message_data = get_edit_message_data(text, chat_id, message_id, final_attachments, timestamp)
+            return Message(update=message_data, api=self.api)
+
         return {}
 
     def edit_message_reply_markup(
@@ -543,6 +566,9 @@ class MaxiBot:
 
         :param reply_markup: Новая клавиатура
         :type reply_markup: Union[InlineKeyboardMarkup, Any]
+
+        :return: Информация об отправленном сообщении
+        :rtype: Message | {} (не успех)
         """
         final_attachments = []
         msg: Message = self.get_message(message_id=message_id)
@@ -553,13 +579,20 @@ class MaxiBot:
                 final_attachments.append(reply_markup.to_attachment())
             else:
                 final_attachments.append(reply_markup)
-        self.api.send_message(
+
+        response = self.api.send_message(
             msg_id=message_id,
             method="PUT",
             attachments=final_attachments,
-            parse_mode=parse_mode.lower()
+            parse_mode=parse_mode
         )
-        return {}
+
+        if isinstance(response, dict) and response.get("success"):
+            timestamp = int(time.time() * 1000)
+            message_data = get_edit_message_data(None, chat_id, message_id, final_attachments, timestamp)
+            return Message(update=message_data, api=self.api)
+
+        return None
 
     def send_message(
         self,

@@ -28,6 +28,11 @@ class UpdateType:
     BOT_ADDED = "bot_added"
 
 
+class WebAppInfo:
+    def __init__(self, url):
+        self.url = url
+
+
 class InlineKeyboardButton:
     """
     Класс для создания inline-кнопок в сообщениях
@@ -47,15 +52,17 @@ class InlineKeyboardButton:
             self,
             text: str,
             url: Optional[str] = None,
-            callback_data: Optional[str] = None
+            callback_data: Optional[str] = None,
+            web_app: Optional[WebAppInfo] = None
     ):
         self.text = text
         self.url = url
         self.callback_data = callback_data
+        self.web_app = web_app.url if web_app else None
 
-        # if not (url or callback_data):
-        #     raise ValueError("url или callback_data обязан быть")
-        if url and callback_data:
+        if not (url or callback_data or web_app):
+            raise ValueError("url, web_app или callback_data обязан быть")
+        if url and callback_data and web_app:
             raise ValueError("укажите что-то одно")
         if url and len(url) > self.MAX_URL_LEN:
             raise ValueError(f"url не может быть длиннее {self.MAX_URL_LEN} символов")
@@ -69,6 +76,8 @@ class InlineKeyboardButton:
         """
         if self.url:
             return {"type": "link", "text": self.text, "url": self.url}
+        elif self.web_app:
+            return {"type": "open_app", "text": self.text, "web_app": self.web_app}
         return {
             "type": "callback",
             "text": self.text,

@@ -501,7 +501,8 @@ class MaxiBot:
         chat_id: Union[str, int],
         message_id: str,
         reply_markup: Union[InlineKeyboardMarkup, Any] = None,
-        parse_mode: Union[str, Any] = "markdown"
+        parse_mode: Union[str, Any] = "markdown",
+        caption: str = None
     ):
         """
         Метод изменения медиа сообщения `message_id` в чате `chat_id`
@@ -530,7 +531,10 @@ class MaxiBot:
                 final_attachments.append(reply_markup.to_attachment())
             else:
                 final_attachments.append(reply_markup)
-        text = get_text(media=media)
+        if caption:
+            text = caption
+        else:
+            text = get_text(media=media)
         parse_mode = get_parse_mode(media=media, parse_mode=parse_mode)
 
         response = self.api.send_message(

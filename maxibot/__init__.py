@@ -1,21 +1,58 @@
 import asyncio
 # import json
+import logging
+import queue
 import re
+import threading
 import time
 import traceback
 
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Callable, Union
 
+from maxibot import apihelper, util
 from maxibot.apihelper import Api
-from maxibot.types import Message, CallbackQuery, InputMedia
+from maxibot.types import Message, CallbackQuery, InputMedia, Update
 from maxibot.types import UpdateType, InlineKeyboardMarkup
 from maxibot.util import extract_command, get_text, get_parse_mode, get_edit_message_data
-# from maxibot.core.attachments.photo import Photo
+from maxibot.exceptions import (
+    MaxApiException,
+    MaxApiHTTPException,
+    MaxApiInvalidJSONException,
+    MaxApiRequestException,
+    MaxApiNotReadyException,
+)
 from maxibot.core.network.polling import Polling
+from maxibot.core.network.webhook import WebhookServer
 
 
 HandlerFunc = Callable[[Message], None]
+
+# Имена типов обновлений telebot, у которых есть точный аналог в MAX:
+# перенесённый @bot.middleware_handler(update_types=['message']) работает как есть
+_TELEBOT_UPDATE_TYPES = {
+    "message": UpdateType.MESSAGE_CREATED,
+    "edited_message": UpdateType.MESSAGE_EDITED,
+    "callback_query": UpdateType.MESSAGE_CALLBACK,
+}
+
+# Типы обновлений telebot, которых в MAX нет (каналы, инлайн-режим, платежи,
+# опросы, реакции): такой middleware регистрируется вхолостую с предупреждением,
+# чтобы перенесённый бот запускался — как с inline_handler
+_TELEBOT_ONLY_UPDATE_TYPES = frozenset((
+    "channel_post", "edited_channel_post", "inline_query", "chosen_inline_result",
+    "shipping_query", "pre_checkout_query", "poll", "poll_answer", "my_chat_member",
+    "chat_member", "chat_join_request", "message_reaction", "message_reaction_count",
+    "chat_boost", "removed_chat_boost",
+))
+
+# Типы обновлений, у которых есть свой объект (Message или CallbackQuery)
+_OBJECT_UPDATE_TYPES = (
+    UpdateType.MESSAGE_CREATED, UpdateType.BOT_STARTED, UpdateType.BOT_ADDED,
+    UpdateType.MESSAGE_EDITED, UpdateType.MESSAGE_CALLBACK,
+)
+
+logger = logging.getLogger("maxibot")
 
 
 @dataclass
@@ -26,17 +63,101 @@ class StepHandler:
     timestamp: float
 
 
+class _WorkerPool:
+    """
+    Пул демон-потоков для выполнения обработчиков — аналог util.ThreadPool
+    из telebot. Именно демон-потоки (ThreadPoolExecutor так не умеет):
+    как и в telebot, Ctrl+C завершает процесс сразу, не дожидаясь
+    зависших или стоящих в очереди обработчиков.
+    """
+
+    def __init__(self, num_threads: int):
+        self._queue = queue.Queue()
+        self._threads = []
+        for i in range(num_threads):
+            thread = threading.Thread(
+                target=self._worker, name=f"maxibot-worker_{i}", daemon=True
+            )
+            thread.start()
+            self._threads.append(thread)
+
+    def submit(self, task: Callable, *args, **kwargs):
+        self._queue.put((task, args, kwargs))
+
+    def _worker(self):
+        while True:
+            task, args, kwargs = self._queue.get()
+            try:
+                task(*args, **kwargs)
+            except Exception:
+                # страховка, чтобы поток пула не умер; сами обработчики
+                # уже обёрнуты в MaxiBot._run_task
+                print(f"Error while processing update: {traceback.format_exc()}")
+            finally:
+                self._queue.task_done()
+
+
 class MaxiBot:
     """
     Главный класс бота
     """
-    def __init__(self, token: str):
+    def __init__(
+        self,
+        token: str,
+        parse_mode: Optional[str] = None,
+        threaded: bool = True,
+        skip_pending: bool = False,
+        num_threads: int = 2
+    ):
         """
         Метод инициализации бота
+
         :param token: Токен бота
         :type token: str
+
+        :param parse_mode: Разметка на весь уровень бота: используется всеми
+            методами отправки и редактирования, если parse_mode не задан в
+            самом вызове (как в telebot). None — прежнее поведение каждого
+            метода: send_message, edit_message_media и edit_message_reply_markup
+            размечают текст как markdown, а подписи к вложениям и
+            edit_message_text уходят без разметки
+        :type parse_mode: Optional[str]
+
+        :param skip_pending: Пропустить обновления, накопленные до запуска
+            бота. Как в telebot, пропуск выполняется один раз — при старте
+            поллинга
+        :type skip_pending: bool
+
+        :param threaded: Как в telebot: если True (по умолчанию),
+            обработчики выполняются в пуле потоков и медленный обработчик
+            не блокирует остальных пользователей. False — прежняя
+            последовательная обработка в потоке поллинга
+        :type threaded: bool
+
+        :param num_threads: Размер пула потоков для обработчиков
+            (используется при threaded=True). По умолчанию 2, как в telebot
+        :type num_threads: int
         """
+        if parse_mode is not None and not isinstance(parse_mode, str):
+            # второй позиционный параметр раньше был threaded: без этой проверки
+            # MaxiBot(token, False) молча снял бы разметку со всех сообщений,
+            # а MaxiBot(token, True) отправил бы в MAX невалидный format: true
+            raise TypeError(
+                "parse_mode должен быть строкой ('markdown' или 'html'), получено "
+                f"{type(parse_mode).__name__}. Порядок параметров — как в telebot: "
+                "MaxiBot(token, parse_mode, threaded, skip_pending, num_threads), "
+                "поэтому threaded и num_threads передавайте по имени: "
+                "MaxiBot(token, threaded=False, num_threads=4)"
+            )
         self.api = Api(token=token)
+        self.parse_mode = parse_mode
+        self.skip_pending = skip_pending
+        self.threaded = threaded
+        self.num_threads = num_threads
+        if threaded:
+            self._worker_pool = _WorkerPool(num_threads=num_threads)
+        else:
+            self._worker_pool = None
         self.handlers = {
             "update": [],  # Общие обработчики для всех типов обновлений
             UpdateType.MESSAGE_CREATED: [],
@@ -48,9 +169,21 @@ class MaxiBot:
         }
         self.message_handlers = []
         self.callback_query_handlers = []
+        # middleware (см. middleware_handler): по типам обновлений MAX и общие.
+        # Как в telebot, регистрация требует apihelper.ENABLE_MIDDLEWARE = True
+        self.typed_middleware_handlers: Dict[str, List[Callable]] = {t: [] for t in util.update_types}
+        self.default_middleware_handlers: List[Callable] = []
         self.poll = None
+        self._webhook: WebhookServer = None
         self.is_running = False
-        self.count_retries = 10
+        self.count_retries = 10  # устарело, оставлено для совместимости
+        # Сколько секунд повторять отправку сообщения, пока MAX обрабатывает
+        # загруженное вложение (ошибка attachment.not.ready). Файлы от
+        # нескольких мегабайт обрабатываются заметно дольше 10 секунд.
+        self.send_retry_timeout = 120
+        # Сколько секунд ждать фактической публикации сообщения с файлом в
+        # чате, чтобы следующие отправленные сообщения не появились раньше него.
+        self.publish_wait_timeout = 10
         self._next_steps: Dict[int, StepHandler] = {}
 
     @staticmethod
@@ -69,19 +202,115 @@ class MaxiBot:
 
     def polling(self, allowed_updates: Optional[List[str]] = None):
         """
-        Функция, которая запускает корутину
+        Запускает получение обновлений через long polling.
         """
         asyncio.run(self.start(allowed_updates=allowed_updates))
 
+    def _skip_updates(self):
+        """
+        Пропускает обновления, накопленные до запуска бота (skip_pending).
+
+        Крутит GET /updates с timeout=0 (запрос возвращается сразу, без
+        long polling), подтверждая полученное маркером, пока очередь не
+        опустеет — поллинг после этого начнёт с чистого листа.
+        """
+        marker = None
+        while True:
+            params = {"timeout": 0}
+            if marker is not None:
+                params["marker"] = marker
+            data = self.api.get_updates([], params) or {}
+            new_marker = data.get("marker")
+            if not data.get("updates") or new_marker is None or new_marker == marker:
+                break
+            marker = new_marker
+
+    def infinity_polling(
+        self,
+        timeout: Optional[int] = 20,
+        skip_pending: Optional[bool] = False,
+        long_polling_timeout: Optional[int] = 20,
+        logger_level: Optional[int] = logging.ERROR,
+        allowed_updates: Optional[List[str]] = None,
+        restart_on_change: Optional[bool] = False,
+        path_to_watch: Optional[str] = None,
+        *args,
+        **kwargs
+    ):
+        """
+        Запускает polling в бесконечном цикле с обработкой исключений,
+        чтобы бот не останавливался из-за ошибок. Сигнатура один в один
+        с telebot.infinity_polling; выход — через bot.stop() или Ctrl+C
+        (KeyboardInterrupt не перехватывается).
+
+        :param timeout: Принимается для совместимости с telebot и
+            игнорируется — таймаутами соединения управляет клиент MAX
+        :type timeout: Optional[int]
+
+        :param skip_pending: Пропустить обновления, накопленные до запуска
+        :type skip_pending: Optional[bool]
+
+        :param long_polling_timeout: Принимается для совместимости с telebot
+            и игнорируется — длительность long polling задаёт сервер MAX
+            (по умолчанию 30 секунд)
+        :type long_polling_timeout: Optional[int]
+
+        :param logger_level: Уровень логирования ошибок цикла (значения из
+            модуля logging). None/NOTSET — ошибки не логируются
+        :type logger_level: Optional[int]
+
+        :param allowed_updates: Список типов обновлений, которые нужно
+            получать. None — все типы
+        :type allowed_updates: Optional[List[str]]
+
+        :param restart_on_change: Принимается для совместимости с telebot
+            и игнорируется — перезапуск по изменению файлов не поддерживается
+        :type restart_on_change: Optional[bool]
+
+        :param path_to_watch: Принимается для совместимости с telebot
+            и игнорируется
+        :type path_to_watch: Optional[str]
+
+        :return: None
+        """
+        if skip_pending:
+            self._skip_updates()
+
+        if restart_on_change:
+            logger.warning("restart_on_change не поддерживается maxibot и игнорируется")
+
+        while True:
+            try:
+                self.polling(allowed_updates=allowed_updates)
+            except Exception as e:
+                if logger_level and logger_level >= logging.ERROR:
+                    logger.error("Infinity polling exception: %s", str(e))
+                if logger_level and logger_level >= logging.DEBUG:
+                    logger.error("Exception traceback:\n%s", traceback.format_exc())
+                # без сброса флага start() откажется перезапускаться
+                self.is_running = False
+                time.sleep(3)
+                continue
+            if not self.is_running:
+                break
+            # polling завершился сам, но stop() не вызывали — перезапускаем
+            if logger_level and logger_level >= logging.INFO:
+                logger.error("Infinity polling: polling exited")
+            time.sleep(3)
+        if logger_level and logger_level >= logging.INFO:
+            logger.error("Break infinity polling")
+
     def stop(self):
         """
-        Метод останавливает поллинг бота
+        Останавливает polling или webhook-сервер бота
         """
         if not self.is_running:
             print("Bot is not running")
             return None
         if self.poll:
             self.poll.stop()
+        if self._webhook:
+            self._webhook.stop()
         self.is_running = False
 
     async def start(self, allowed_updates: Optional[List[str]] = None):
@@ -94,6 +323,11 @@ class MaxiBot:
         if self.is_running:
             print("Bot is already running")
             return None
+        if self.skip_pending:
+            # как в telebot: пропуск накопленных обновлений выполняется один
+            # раз, чтобы перезапуск поллинга не терял свежие сообщения
+            self._skip_updates()
+            self.skip_pending = False
         self.is_running = True
         self.poll = Polling(api=self.api, allowed_updates=allowed_updates)
         await self.poll.loop(self._process_update)
@@ -136,6 +370,143 @@ class MaxiBot:
             return funcs
         return decorator
 
+    def middleware_handler(self, update_types: Optional[List[str]] = None):
+        """
+        Декоратор для регистрации middleware — функции, которую бот вызывает
+        для каждого обновления до любых обработчиков. Сигнатура один в один
+        с telebot.middleware_handler; как и в telebot, сначала нужно
+        включить apihelper.ENABLE_MIDDLEWARE = True, иначе регистрация
+        бросит RuntimeError.
+
+        Middleware получает два аргумента: бота и обновление. С update_types
+        это объект своего типа: Message для message_created и
+        message_edited, CallbackQuery для message_callback; у остальных
+        типов (message_removed, bot_stopped, user_added...) своего объекта
+        нет — придёт Update целиком, сырой payload в update.json. Как в
+        telebot, middleware для message_created получает каждое сообщение,
+        которое дойдёт до обработчиков сообщений: в MAX это и bot_started
+        (кнопка «Начать» приходит как /start), и bot_added. Без
+        update_types middleware вызывается для всех обновлений и получает
+        Update. Обработчики получают те же объекты, поэтому атрибуты,
+        выставленные в middleware, видны в обработчике.
+
+        Порядок — как в telebot: сначала middleware своего типа, затем
+        общие, потом обработчики. Middleware выполняется до обработчиков в
+        потоке, принявшем обновление, даже при threaded=True: при поллинге
+        это единственный поток поллинга, и долгая работа в middleware
+        задержит остальные обновления; при webhook у каждого запроса свой
+        поток, и middleware разных обновлений выполняются параллельно.
+        Исключение в middleware печатается, а обновление дальше не
+        обрабатывается — обработчики не вызываются (как telebot с
+        suppress_middleware_excepions=True; ронять поллинг, как telebot по
+        умолчанию, maxibot не станет).
+
+        Пример:
+
+            from maxibot import MaxiBot, apihelper
+
+            apihelper.ENABLE_MIDDLEWARE = True
+            bot = MaxiBot("TOKEN")
+
+            @bot.middleware_handler(update_types=['message_created'])
+            def add_lang(bot_instance, message):
+                message.lang = message.from_user.language_code or "ru"
+
+            @bot.middleware_handler()
+            def log_update(bot_instance, update):
+                print(update.update_type, update.json)
+
+        :param update_types: Типы обновлений MAX, для которых вызывать
+            middleware (все — в maxibot.util.update_types); телеботовские
+            'message', 'edited_message' и 'callback_query' тоже принимаются,
+            а типы telebot, которых в MAX нет (channel_post, inline_query...),
+            пропускаются с предупреждением в логе — перенесённый бот
+            запускается, как и с inline_handler. None — для всех обновлений
+        :type update_types: Optional[List[str]]
+
+        :return: Декоратор, возвращающий функцию без изменений
+        :rtype: Callable
+        """
+        def decorator(handler):
+            self.add_middleware_handler(handler, update_types)
+            return handler
+
+        return decorator
+
+    def add_middleware_handler(self, handler, update_types=None):
+        """
+        Регистрирует middleware (см. middleware_handler). Сигнатура один в
+        один с telebot.add_middleware_handler
+
+        :param handler: Функция middleware: handler(bot, update)
+        :type handler: Callable
+
+        :param update_types: Типы обновлений, None — все
+        :type update_types: Optional[List[str]]
+
+        :raises RuntimeError: если не включён apihelper.ENABLE_MIDDLEWARE
+        :raises ValueError: если тип обновления неизвестен ни MAX, ни telebot
+        """
+        if not apihelper.ENABLE_MIDDLEWARE:
+            raise RuntimeError(
+                "Middleware выключены. Как в telebot, до регистрации выполните "
+                "apihelper.ENABLE_MIDDLEWARE = True (from maxibot import apihelper)"
+            )
+        if not update_types:
+            self.default_middleware_handlers.append(handler)
+            return
+        if isinstance(update_types, str):
+            update_types = [update_types]
+        resolved, unsupported, unknown = [], [], []
+        for update_type in update_types:
+            update_type = _TELEBOT_UPDATE_TYPES.get(update_type, update_type)
+            if update_type in self.typed_middleware_handlers:
+                resolved.append(update_type)
+            elif update_type in _TELEBOT_ONLY_UPDATE_TYPES:
+                unsupported.append(update_type)
+            else:
+                unknown.append(update_type)
+        if unknown:
+            # telebot молча сделал бы такой middleware общим, и он получал бы все
+            # обновления не того типа — лучше упасть при регистрации
+            raise ValueError(
+                f"Нет таких типов обновлений в MAX: {', '.join(map(repr, unknown))}. "
+                f"Доступны: {', '.join(util.update_types)}; из telebot принимаются "
+                f"{', '.join(_TELEBOT_UPDATE_TYPES)}"
+            )
+        if unsupported:
+            name = getattr(handler, "__name__", repr(handler))
+            if resolved:
+                logger.warning(
+                    "Middleware %s: обновлений %s в MAX нет, для них он вызван не будет",
+                    name, ", ".join(unsupported)
+                )
+            else:
+                logger.warning(
+                    "Middleware %s зарегистрирован, но никогда не будет вызван: "
+                    "обновлений %s в MAX нет", name, ", ".join(unsupported)
+                )
+        # алиас и имя MAX в одном списке ('message', 'message_created') — одна регистрация
+        for update_type in dict.fromkeys(resolved):
+            self.typed_middleware_handlers[update_type].append(handler)
+
+    def register_middleware_handler(self, callback, update_types=None):
+        """
+        Регистрирует middleware без декоратора (см. middleware_handler).
+        Сигнатура один в один с telebot.register_middleware_handler
+
+            bot.register_middleware_handler(log_update, update_types=['message_created'])
+
+        :param callback: Функция middleware: callback(bot, update)
+        :type callback: Callable
+
+        :param update_types: Типы обновлений, None — все
+        :type update_types: Optional[List[str]]
+
+        :return: None
+        """
+        self.add_middleware_handler(callback, update_types)
+
     def run_handler(self, context: Message, message_handlers: List[Dict]):
         """
         Метод запуска обработчиков событий текстового сообщения
@@ -145,7 +516,7 @@ class MaxiBot:
         """
         for handler in message_handlers:
             if self._check_filters(context=context, handler=handler):
-                handler.get("function")(context)
+                self._exec_task(handler.get("function"), context)
                 break
 
     def _test_filter(self, message_filter: str, filter_value: List, context: Message):
@@ -220,35 +591,129 @@ class MaxiBot:
         #     if pattern == text or re.search(pattern, text):
         #         handler(context)
 
+    def process_middlewares(self, update: Update) -> bool:
+        """
+        Прогоняет обновление через middleware (аналог
+        telebot.process_middlewares): сначала middleware своего типа, затем
+        общие. Middleware своего типа получает объект этого типа (Message,
+        CallbackQuery), а если у типа обновления своего объекта нет —
+        Update; общий middleware всегда получает Update.
+
+        Как в telebot, middleware для message_created получает каждое
+        сообщение, которое дойдёт до обработчиков сообщений, — в MAX это и
+        bot_started (кнопка «Начать» приходит как /start), и bot_added;
+        затем вызываются middleware самого типа обновления, каждая функция
+        — один раз
+
+        :param update: Обновление
+        :type update: Update
+
+        :return: False, если какой-то middleware упал — обновление тогда
+            дальше не обрабатывается
+        :rtype: bool
+        """
+        if update.message is not None:
+            context, types = update.message, [UpdateType.MESSAGE_CREATED, update.update_type]
+        elif update.edited_message is not None:
+            context, types = update.edited_message, [UpdateType.MESSAGE_EDITED]
+        elif update.callback_query is not None:
+            context, types = update.callback_query, [UpdateType.MESSAGE_CALLBACK]
+        elif update.update_type in _OBJECT_UPDATE_TYPES:
+            # объект своего типа построить не удалось — как в telebot, middleware
+            # этого типа пропускаем, общие всё равно получат Update
+            context, types = update, []
+        else:
+            context, types = update, [update.update_type]
+        typed = []
+        for update_type in dict.fromkeys(types):
+            for middleware in self.typed_middleware_handlers.get(update_type, []):
+                if middleware not in typed:
+                    typed.append(middleware)
+        calls = [(m, context) for m in typed] + [(m, update) for m in self.default_middleware_handlers]
+        for middleware, ctx in calls:
+            try:
+                middleware(self, ctx)
+            except Exception:
+                name = getattr(middleware, "__qualname__", repr(middleware))
+                print(f"Error in middleware {name}, update skipped: {traceback.format_exc()}")
+                return False
+        return True
+
     def _process_update(self, update: Dict[str, Any]):
         """
-        Метод для обработки входящего полученного обновления
+        Метод для обработки входящего полученного обновления: сначала
+        middleware, затем обработчики
 
         :param update: Данные по обновлениям
         :type update: Dict[str, Any]
         """
         try:
-            # print("===============\nUPDATE RECEIVED\n===============")
-            # print(f"Update type: {update.get('update_type')}")
-            # print(f"Full update: {json.dumps(update, indent=2)}")
-
             update_type = update.get("update_type")
-            if update_type == UpdateType.MESSAGE_CREATED and "message" in update.keys() or \
-               update_type == UpdateType.BOT_STARTED or update_type == UpdateType.BOT_ADDED:
-                context = Message(update, self.api)
-                if context.from_user.id in self._next_steps:
-                    handler = self._next_steps.pop(context.from_user.id)
-                    handler.callback(context, *handler.args, **handler.kwargs)
+            has_handlers = update_type in (
+                UpdateType.MESSAGE_CREATED, UpdateType.BOT_STARTED, UpdateType.BOT_ADDED, UpdateType.MESSAGE_CALLBACK
+            )
+            if not has_handlers and not (
+                self.default_middleware_handlers or self.typed_middleware_handlers.get(update_type)
+            ):
+                # остальные типы обновлений бот не обрабатывает — объекты не
+                # строим: Message ради названия чата ходит в API
+                return
+            upd = Update(update, self.api)
+            if not self.process_middlewares(upd):
+                return
+            if upd.message is not None:
+                # атомарный pop вместо `in` + pop: clear_step_handler может
+                # выполняться в воркере параллельно и убрать ключ между
+                # проверкой и извлечением — сообщение тогда потерялось бы
+                handler = self._next_steps.pop(upd.message.from_user.id, None)
+                if handler is not None:
+                    self._exec_task(handler.callback, upd.message, *handler.args, **handler.kwargs)
                 else:
-                    self._process_text_message(context)
-            elif update_type == UpdateType.MESSAGE_CALLBACK:
+                    self._process_text_message(upd.message)
+            elif upd.callback_query is not None:
                 print("Processing message_callback...")
-                if "callback" in update:
-                    callback = CallbackQuery(update, self.api)
-                    # print(f"Created callback: id={callback.id}, data={callback.data}")
-                    self._process_callback_query(callback)
+                self._process_callback_query(upd.callback_query)
         except Exception:
             print(f"Error while processing update: {traceback.format_exc()}")
+
+    def _exec_task(self, task: Callable, *args, **kwargs):
+        """
+        Выполняет пользовательский обработчик: при threaded=True — в пуле
+        потоков (как telebot), иначе синхронно в текущем потоке. Фильтры
+        при этом всегда проверяются в потоке поллинга, в пул уходит
+        только сам обработчик.
+        """
+        if getattr(self, "_worker_pool", None):
+            self._worker_pool.submit(self._run_task, task, *args, **kwargs)
+        else:
+            self._run_task(task, *args, **kwargs)
+
+    @staticmethod
+    def _run_task(task: Callable, *args, **kwargs):
+        """
+        Вызов обработчика с перехватом ошибок: исключение в потоке пула
+        иначе молча потерялось бы внутри Future.
+        """
+        try:
+            task(*args, **kwargs)
+        except Exception:
+            print(f"Error while processing update: {traceback.format_exc()}")
+
+    def _resolve_parse_mode(self, parse_mode, default=None):
+        """
+        Определяет разметку сообщения. Как в telebot: parse_mode из вызова
+        важнее общей разметки бота (``MaxiBot(token, parse_mode=...)``), а
+        если не задан ни там, ни там — остаётся ``default``, прежнее
+        поведение конкретного метода. Пустая строка отключает разметку.
+
+        :param parse_mode: Разметка, переданная в вызов метода
+        :param default: Разметка метода по умолчанию
+
+        :return: Разметка в нижнем регистре (MAX ждёт markdown/html)
+        """
+        if parse_mode is None:
+            parse_mode = self.parse_mode if self.parse_mode is not None else default
+        return parse_mode.lower() if isinstance(parse_mode, str) else parse_mode
 
     def _check_text_length(self, text):
         """
@@ -279,13 +744,222 @@ class MaxiBot:
         )
         self._next_steps[message.from_user.id] = handler
 
+    def clear_step_handler(self, message: Message) -> None:
+        """
+        Сбрасывает обработчик, зарегистрированный через register_next_step_handler().
+
+        Сигнатура один в один с telebot. Используется, когда пользователь ушёл
+        в другой раздел меню, не ответив на ожидаемый вопрос.
+
+        :param message: Сообщение из чата, для которого сбрасывается ожидание
+        :type message: Message
+
+        :return: None
+        """
+        self.clear_step_handler_by_chat_id(message.chat.id)
+
+    def clear_step_handler_by_chat_id(self, chat_id: Union[int, str]) -> None:
+        """
+        Сбрасывает обработчик, зарегистрированный через register_next_step_handler().
+
+        Сигнатура один в один с telebot. В maxibot step-handlers ключуются по
+        ``from_user.id``, который в MAX равен ``chat_id`` диалога (см. класс User) —
+        поэтому chat_id здесь и есть ключ.
+
+        :param chat_id: Чат, для которого сбрасывается ожидание ввода
+        :type chat_id: Union[int, str]
+
+        :return: None
+        """
+        self._next_steps.pop(chat_id, None)
+        # register_next_step_handler мог положить ключ и как int, и как str —
+        # подчищаем оба представления
+        if isinstance(chat_id, str) and chat_id.isdigit():
+            self._next_steps.pop(int(chat_id), None)
+        elif isinstance(chat_id, int):
+            self._next_steps.pop(str(chat_id), None)
+
+    # -------------------------------------------------------------------------
+    # Webhook
+    # -------------------------------------------------------------------------
+
+    def set_webhook(
+        self,
+        url: str,
+        secret: Optional[str] = None,
+        allowed_updates: Optional[List[str]] = None
+    ) -> dict:
+        """
+        Регистрирует webhook в MAX API.
+
+        :param url: Публичный HTTPS-адрес, на который MAX будет слать обновления
+        :param secret: Секрет для проверки заголовка X-Max-Bot-Api-Secret (5–256 символов)
+        :param allowed_updates: Список типов обновлений (None — все)
+        """
+        return self.api.set_webhook(url=url, update_types=allowed_updates, secret=secret)
+
+    def delete_webhook(self, url: str) -> dict:
+        """
+        Удаляет webhook-подписку из MAX API.
+
+        :param url: URL подписки для удаления
+        """
+        return self.api.delete_webhook(url=url)
+
+    def get_webhook_info(self) -> dict:
+        """
+        Возвращает список активных webhook-подписок.
+        """
+        return self.api.get_webhook_info()
+
+    def start_webhook(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 443,
+        secret: Optional[str] = None,
+        webhook_url: Optional[str] = None,
+        allowed_updates: Optional[List[str]] = None
+    ):
+        """
+        Запускает локальный HTTP-сервер для приёма обновлений через webhook.
+
+        :param host: Адрес для прослушивания (по умолчанию '0.0.0.0')
+        :param port: Порт для прослушивания (по умолчанию 443, как требует MAX)
+        :param secret: Секрет для валидации заголовка X-Max-Bot-Api-Secret (опционально)
+        :param webhook_url: Если указан — автоматически регистрирует этот URL в MAX API
+                            через POST /subscriptions
+        :param allowed_updates: Список типов обновлений (None — все)
+
+        Пример использования::
+
+            bot.start_webhook(
+                host="0.0.0.0",
+                port=443,
+                secret="my-secret",
+                webhook_url="https://example.com/webhook"
+            )
+        """
+        if self.is_running:
+            print("Bot is already running")
+            return
+
+        if webhook_url:
+            self.set_webhook(url=webhook_url, secret=secret, allowed_updates=allowed_updates)
+
+        self._webhook = WebhookServer(host=host, port=port, secret=secret)
+        self._webhook.start(handler=self._process_update)
+        self.is_running = True
+
+        try:
+            import time
+            while self.is_running:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            self.stop()
+
+    def _send_attachments(self, chat_id, text, attachments, parse_mode, disable_link_preview=None):
+        """
+        Отправляет сообщение с вложениями, повторяя отправку, пока MAX
+        обрабатывает загруженный файл (ошибка ``attachment.not.ready``).
+
+        Вложение при этом повторно не загружается — используется уже
+        полученный токен. Если API так и не принял сообщение за
+        ``send_retry_timeout`` секунд, выбрасывается ``MaxApiNotReadyException``
+        вместо возврата пустого объекта Message без атрибутов.
+        """
+        deadline = time.monotonic() + self.send_retry_timeout
+        pause = 1
+        while True:
+            try:
+                response = self.api.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    attachments=attachments,
+                    parse_mode=parse_mode,
+                    disable_link_preview=disable_link_preview
+                )
+                break
+            except MaxApiException as exc:
+                if not self._is_attachment_not_ready(exc):
+                    raise
+                if time.monotonic() + pause > deadline:
+                    raise MaxApiNotReadyException(
+                        f"MAX API не принял сообщение за {self.send_retry_timeout} c "
+                        f"(вложение не обработано): {exc}",
+                        function_name=getattr(exc, "function_name", None),
+                        result=getattr(exc, "result", None)
+                    ) from exc
+                time.sleep(pause)
+                pause = min(pause + 1, 5)
+
+        message = Message(update=response, api=self.api)
+        self._wait_message_published(message)
+        return message
+
+    def _wait_message_published(self, message):
+        """
+        Ждёт, пока отправленное сообщение с файлом станет видно в чате.
+
+        MAX публикует сообщение с файловым вложением только после окончания
+        обработки файла, поэтому сообщение, отправленное следом, может
+        появиться в чате раньше него. Ожидание сохраняет порядок отправки.
+        Если сообщение уже опубликовано (обычный случай), проверка занимает
+        один запрос без пауз; по истечении ``publish_wait_timeout`` ожидание
+        прекращается без ошибки.
+        """
+        message_id = getattr(message, "message_id", None)
+        if not message_id:
+            return
+        deadline = time.monotonic() + self.publish_wait_timeout
+        while True:
+            try:
+                info = self.api.get_message(message_id)
+                if isinstance(info, dict) and self._file_attachments_ready(info):
+                    return
+            except MaxApiException:
+                # Сообщение ещё не опубликовано (например, 404) — продолжаем ждать.
+                pass
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(1)
+
+    @staticmethod
+    def _file_attachments_ready(info):
+        """
+        Проверяет, что у файловых вложений сообщения появился url — признак
+        того, что обработка файла закончена и сообщение опубликовано.
+        """
+        body = (info.get("message") or info).get("body") or {}
+        for attachment in body.get("attachments") or []:
+            if attachment.get("type") == "file" and not (attachment.get("payload") or {}).get("url"):
+                return False
+        return True
+
+    @staticmethod
+    def _is_attachment_not_ready(exc):
+        """
+        Определяет, что ошибка API — это ``attachment.not.ready`` (файл ещё
+        обрабатывается на стороне MAX), а не какая-то другая ошибка.
+        """
+        if "attachment.not.ready" in str(exc):
+            return True
+        result = getattr(exc, "result", None)
+        text = getattr(result, "text", "") or ""
+        if "attachment.not.ready" in text:
+            return True
+        result_json = getattr(exc, "result_json", None)
+        if isinstance(result_json, dict) and result_json.get("code") == "attachment.not.ready":
+            return True
+        return False
+
     def send_photo(
         self,
         chat_id: Union[int, str],
         photo: Union[Any, str],
         caption: Optional[str] = None,
         parse_mode: Optional[str] = None,
-        reply_markup: Union[InlineKeyboardMarkup, Any] = None
+        reply_markup: Union[InlineKeyboardMarkup, Any] = None,
+        disable_web_page_preview: Optional[bool] = None
     ):
         """
         Отправляет сообщение с фото
@@ -293,14 +967,25 @@ class MaxiBot:
         :param chat_id: Чат, куда надо отправить сообщение
         :type chat_id: Union[int, str]
 
-        :param photo: Объект фото
+        :param photo: Фото — байты, file-like объект, InputMedia или, как
+            в telebot, строка: прямая http(s)-ссылка на изображение (MAX
+            скачает его сам, без POST /uploads) либо токен ранее
+            загруженного изображения (аналог file_id, лежит в
+            message.photo.payload.token)
         :type photo: Union[Any, str]
 
         :param caption: Текст сообщения под фото
         :type caption: Optional[str]
 
-        :param parse_mode: Разметка сообщения
+        :param parse_mode: Разметка подписи (markdown/html). Если не задана,
+            берётся общая разметка бота — MaxiBot(token, parse_mode=...);
+            если и там пусто, подпись уходит без разметки
         :type parse_mode: Optional[str]
+
+        :param disable_web_page_preview: Если True, сервер не генерирует превью
+            для ссылок в подписи (в MAX caption — это text того же POST /messages).
+            В telebot у send_photo параметра нет — расширение для MAX
+        :type disable_web_page_preview: Optional[bool]
 
         :return: Информация об отправленном сообщении
         :rtype: Dict[str, Any]
@@ -311,21 +996,16 @@ class MaxiBot:
         final_attachments = []
         if isinstance(photo, InputMedia):
             final_attachments.append(photo.to_dict(api=self.api))
-        final_attachments.append(InputMedia(media=photo).to_dict(api=self.api))
+        else:
+            final_attachments.append(InputMedia(media=photo).to_dict(api=self.api))
         if reply_markup:
             if hasattr(reply_markup, 'to_attachment'):
                 final_attachments.append(reply_markup.to_attachment())
             else:
                 final_attachments.append(reply_markup)
-        return Message(
-            update=self.api.send_message(
-                chat_id=chat_id,
-                text=caption,
-                attachments=final_attachments,
-                parse_mode=parse_mode
-            ),
-            api=self.api
-        )
+        return self._send_attachments(chat_id, caption, final_attachments,
+                                      self._resolve_parse_mode(parse_mode),
+                                      disable_link_preview=disable_web_page_preview)
 
     def send_media_group(
         self,
@@ -333,7 +1013,8 @@ class MaxiBot:
         media: list,
         caption: Optional[str] = None,
         parse_mode: Optional[str] = None,
-        reply_markup: Union[InlineKeyboardMarkup, Any] = None
+        reply_markup: Union[InlineKeyboardMarkup, Any] = None,
+        disable_web_page_preview: Optional[bool] = None
     ):
         """
         Отправляет сообщение с фото
@@ -341,14 +1022,23 @@ class MaxiBot:
         :param chat_id: Чат, куда надо отправить сообщение
         :type chat_id: Union[int, str]
 
-        :param photo: Объект фото
-        :type photo: Union[Any, str]
+        :param media: Список фото — байты, file-like объекты, InputMedia
+            или, как в telebot, строки: прямые http(s)-ссылки (MAX скачает
+            их сам) либо токены ранее загруженных изображений
+        :type media: list
 
         :param caption: Текст сообщения под фото
         :type caption: Optional[str]
 
-        :param parse_mode: Разметка сообщения
+        :param parse_mode: Разметка подписи (markdown/html). Если не задана,
+            берётся общая разметка бота — MaxiBot(token, parse_mode=...);
+            если и там пусто, подпись уходит без разметки
         :type parse_mode: Optional[str]
+
+        :param disable_web_page_preview: Если True, сервер не генерирует превью
+            для ссылок в подписи. В telebot у send_media_group параметра нет —
+            расширение для MAX
+        :type disable_web_page_preview: Optional[bool]
 
         :return: Информация об отправленном сообщении
         :rtype: Dict[str, Any]
@@ -367,15 +1057,9 @@ class MaxiBot:
                 final_attachments.append(reply_markup.to_attachment())
             else:
                 final_attachments.append(reply_markup)
-        return Message(
-            update=self.api.send_message(
-                chat_id=chat_id,
-                text=caption,
-                attachments=final_attachments,
-                parse_mode=parse_mode
-            ),
-            api=self.api
-        )
+        return self._send_attachments(chat_id, caption, final_attachments,
+                                      self._resolve_parse_mode(parse_mode),
+                                      disable_link_preview=disable_web_page_preview)
 
     def send_document(
         self,
@@ -384,7 +1068,8 @@ class MaxiBot:
         caption: Optional[str] = None,
         parse_mode: Optional[str] = None,
         reply_markup: Union[InlineKeyboardMarkup, Any] = None,
-        visible_file_name: Optional[str] = None
+        visible_file_name: Optional[str] = None,
+        disable_web_page_preview: Optional[bool] = None
     ):
         """
         Отправляет сообщение с файлом
@@ -392,14 +1077,23 @@ class MaxiBot:
         :param chat_id: Чат, куда надо отправить сообщение
         :type chat_id: Union[int, str]
 
-        :param document: Объект файла
+        :param document: Файл — байты или file-like объект. URL-строка не
+            поддерживается (ValueError): MAX принимает URL только для
+            изображений
         :type document: Union[Any, str]
 
         :param caption: Текст сообщения под фото
         :type caption: Optional[str]
 
-        :param parse_mode: Разметка сообщения
+        :param parse_mode: Разметка подписи (markdown/html). Если не задана,
+            берётся общая разметка бота — MaxiBot(token, parse_mode=...);
+            если и там пусто, подпись уходит без разметки
         :type parse_mode: Optional[str]
+
+        :param disable_web_page_preview: Если True, сервер не генерирует превью
+            для ссылок в подписи к файлу. В telebot у send_document параметра
+            нет — расширение для MAX
+        :type disable_web_page_preview: Optional[bool]
 
         :return: Информация об отправленном сообщении
         :rtype: Dict[str, Any]
@@ -407,6 +1101,11 @@ class MaxiBot:
 
         if self._check_text_length(text=caption):
             raise ValueError(f'caption должен быть меньше 4000 символов.\nСейчас их {len(caption)}')
+        if isinstance(document, str) and document.startswith(("http://", "https://")):
+            raise ValueError(
+                "MAX принимает URL только для изображений (send_photo). "
+                "Документ можно отправить только байтами или file-like объектом"
+            )
         final_attachments = []
         if isinstance(document, InputMedia) and document.type == "file":
             final_attachments.append(document.to_dict(api=self.api))
@@ -419,18 +1118,97 @@ class MaxiBot:
                 final_attachments.append(reply_markup.to_attachment())
             else:
                 final_attachments.append(reply_markup)
-        for _ in range(self.count_retries):
-            response = self.api.send_message(
-                chat_id=chat_id,
-                text=caption,
-                attachments=final_attachments,
-                parse_mode=parse_mode.lower()
+        return self._send_attachments(
+            chat_id, caption, final_attachments,
+            self._resolve_parse_mode(parse_mode),
+            disable_link_preview=disable_web_page_preview
+        )
+
+    def send_video(
+        self,
+        chat_id: Union[int, str],
+        video: Union[Any, str],
+        duration: Optional[int] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        thumbnail: Optional[Any] = None,
+        caption: Optional[str] = None,
+        parse_mode: Optional[str] = None,
+        reply_markup: Union[InlineKeyboardMarkup, Any] = None,
+        disable_web_page_preview: Optional[bool] = None
+    ):
+        """
+        Отправляет сообщение с видео. Порядок первых позиционных параметров —
+        как у telebot.send_video: (chat_id, video, duration, width, height,
+        thumbnail, caption, parse_mode).
+
+        Видео загружается в MAX через POST /uploads?type=video (форматы
+        MP4/MOV/MKV/WEBM, до 250 МБ), затем отправляется вложением
+        {"type": "video", "payload": {"token": ...}} в POST /messages.
+
+        :param chat_id: Чат, куда надо отправить сообщение
+        :type chat_id: Union[int, str]
+
+        :param video: Видео — байты или file-like объект. URL-строка не
+            поддерживается (ValueError): MAX принимает URL только для
+            изображений
+        :type video: Union[Any, str]
+
+        :param duration: Принимается для совместимости с telebot и
+            игнорируется — MAX определяет длительность из самого файла
+        :type duration: Optional[int]
+
+        :param width: Принимается для совместимости с telebot и игнорируется —
+            MAX определяет ширину из самого файла
+        :type width: Optional[int]
+
+        :param height: Принимается для совместимости с telebot и игнорируется —
+            MAX определяет высоту из самого файла
+        :type height: Optional[int]
+
+        :param thumbnail: Принимается для совместимости с telebot и
+            игнорируется — Bot API MAX не позволяет задать обложку видео
+        :type thumbnail: Optional[Any]
+
+        :param caption: Текст сообщения под видео
+        :type caption: Optional[str]
+
+        :param parse_mode: Разметка подписи (markdown/html). Если не задана,
+            берётся общая разметка бота — MaxiBot(token, parse_mode=...);
+            если и там пусто, подпись уходит без разметки
+        :type parse_mode: Optional[str]
+
+        :param disable_web_page_preview: Если True, сервер не генерирует превью
+            для ссылок в подписи. В telebot у send_video параметра нет —
+            расширение для MAX
+        :type disable_web_page_preview: Optional[bool]
+
+        :return: Информация об отправленном сообщении
+        :rtype: Message
+        """
+
+        if self._check_text_length(text=caption):
+            raise ValueError(f'caption должен быть меньше 4000 символов.\nСейчас их {len(caption)}')
+        if isinstance(video, str) and video.startswith(("http://", "https://")):
+            raise ValueError(
+                "MAX принимает URL только для изображений (send_photo). "
+                "Видео можно отправить только байтами или file-like объектом"
             )
-            if isinstance(response, str):
-                time.sleep(1)
-                continue
-            break
-        return Message(update=response, api=self.api)
+        final_attachments = []
+        if isinstance(video, InputMedia) and video.type == "video":
+            final_attachments.append(video.to_dict(api=self.api))
+        else:
+            final_attachments.append(InputMedia(type="video", media=video).to_dict(api=self.api))
+        if reply_markup:
+            if hasattr(reply_markup, 'to_attachment'):
+                final_attachments.append(reply_markup.to_attachment())
+            else:
+                final_attachments.append(reply_markup)
+        return self._send_attachments(
+            chat_id, caption, final_attachments,
+            self._resolve_parse_mode(parse_mode),
+            disable_link_preview=disable_web_page_preview
+        )
 
     def delete_message(
         self,
@@ -469,6 +1247,11 @@ class MaxiBot:
         :param message_id: Айди сообщения
         :type message_id: int
 
+        :param parse_mode: Разметка сообщения (markdown/html). Если не задана,
+            берётся общая разметка бота — MaxiBot(token, parse_mode=...);
+            если и там пусто, текст уходит без разметки
+        :type parse_mode: Optional[str]
+
         :return: Информация об отправленном сообщении
         :rtype: Message | {} (не успех)
         """
@@ -485,7 +1268,7 @@ class MaxiBot:
             text=text,
             method="PUT",
             attachments=final_attachments,
-            parse_mode=parse_mode
+            parse_mode=self._resolve_parse_mode(parse_mode)
         )
 
         if isinstance(response, dict) and response.get("success"):
@@ -501,7 +1284,7 @@ class MaxiBot:
         chat_id: Union[str, int],
         message_id: str,
         reply_markup: Union[InlineKeyboardMarkup, Any] = None,
-        parse_mode: Union[str, Any] = "markdown"
+        parse_mode: Union[str, Any] = None
     ):
         """
         Метод изменения медиа сообщения `message_id` в чате `chat_id`
@@ -514,6 +1297,12 @@ class MaxiBot:
 
         :param message_id: Айди сообщения
         :type message_id: int
+
+        :param parse_mode: Разметка подписи (markdown/html). Разметка самого
+            media (InputMedia(parse_mode=...)) важнее. Если не задана, берётся
+            общая разметка бота — MaxiBot(token, parse_mode=...); если и там
+            пусто, подпись размечается как markdown, как и раньше
+        :type parse_mode: Optional[str]
 
         :return: Информация об отправленном сообщении
         :rtype: Message | {} (не успех)
@@ -531,7 +1320,10 @@ class MaxiBot:
             else:
                 final_attachments.append(reply_markup)
         text = get_text(media=media)
-        parse_mode = get_parse_mode(media=media, parse_mode=parse_mode)
+        parse_mode = get_parse_mode(
+            media=media,
+            parse_mode=self._resolve_parse_mode(parse_mode, default="markdown")
+        )
 
         response = self.api.send_message(
             msg_id=message_id,
@@ -553,7 +1345,7 @@ class MaxiBot:
         chat_id: Union[str, int],
         message_id: str,
         reply_markup: Union[InlineKeyboardMarkup, Any] = None,
-        parse_mode: Union[str, Any] = "markdown"
+        parse_mode: Union[str, Any] = None
     ):
         """
         Метод изменения клавиатуры сообщения `message_id` в чате `chat_id`
@@ -584,7 +1376,7 @@ class MaxiBot:
             msg_id=message_id,
             method="PUT",
             attachments=final_attachments,
-            parse_mode=parse_mode
+            parse_mode=self._resolve_parse_mode(parse_mode, default="markdown")
         )
 
         if isinstance(response, dict) and response.get("success"):
@@ -600,8 +1392,10 @@ class MaxiBot:
         text: str,
         attachments: Optional[List[Dict[str, Any]]] = None,
         reply_markup: Optional[Any] = None,
-        parse_mode: str = "markdown",
-        notify: bool = True
+        parse_mode: Optional[str] = None,
+        notify: bool = True,
+        disable_web_page_preview: Optional[bool] = None,
+        reply_to_message_id: Optional[str] = None
     ) -> Message:
         """
         Отправляет ответ на текущее сообщение/обновление
@@ -614,6 +1408,23 @@ class MaxiBot:
 
         :param keyboard: Объект клавиатуры (будет добавлен к attachments)
         :type keyboard:
+
+        :param parse_mode: Разметка сообщения (markdown/html). Если не задана,
+            берётся общая разметка бота — MaxiBot(token, parse_mode=...);
+            если и там пусто, текст размечается как markdown, как и раньше.
+            Пустая строка отключает разметку
+        :type parse_mode: Optional[str]
+
+        :param disable_web_page_preview: Если True, сервер не генерирует превью
+            для ссылок в тексте (имя параметра как в telebot; в MAX API это
+            query-параметр disable_link_preview). None — поведение сервера
+            по умолчанию
+        :type disable_web_page_preview: Optional[bool]
+
+        :param reply_to_message_id: Идентификатор сообщения, на которое нужно
+            ответить (имя параметра как в telebot; в MAX API это поле
+            link={"type": "reply", "mid": ...} в теле запроса)
+        :type reply_to_message_id: Optional[str]
 
         :return: Информация об отправленном сообщении
         :rtype: Message
@@ -632,16 +1443,41 @@ class MaxiBot:
             else:
                 final_attachments.append(reply_markup)
 
+        link = None
+        if reply_to_message_id:
+            link = {"type": "reply", "mid": reply_to_message_id}
+
         return Message(
             update=self.api.send_message(
                 chat_id=chat_id,
                 text=text,
                 attachments=final_attachments,
-                parse_mode=parse_mode.lower(),
-                notify=notify
+                parse_mode=self._resolve_parse_mode(parse_mode, default="markdown"),
+                notify=notify,
+                disable_link_preview=disable_web_page_preview,
+                link=link
             ),
             api=self.api
         )
+
+    def reply_to(self, message: Message, text: str, **kwargs) -> Message:
+        """
+        Отвечает на сообщение `message` (цитата-реплай). Удобная обёртка,
+        как в telebot: send_message(message.chat.id, text,
+        reply_to_message_id=message.message_id, **kwargs)
+
+        :param message: Сообщение, на которое нужно ответить
+        :type message: Message
+
+        :param text: Текст ответа
+        :type text: str
+
+        :param kwargs: Дополнительные параметры, передаются в send_message
+
+        :return: Информация об отправленном сообщении
+        :rtype: Message
+        """
+        return self.send_message(message.chat.id, text, reply_to_message_id=message.message_id, **kwargs)
 
     def get_message(self, message_id: str):
         """
@@ -725,7 +1561,201 @@ class MaxiBot:
             # print(f"Checking handler with filters: {handler['filters']}")
             if self._check_filters(callback, handler):
                 # print("Handler matched! Calling function...")
-                handler["function"](callback)
+                self._exec_task(handler["function"], callback)
                 break
         else:
             print("No matching handler found for callback")
+
+    def answer_callback_query(
+        self,
+        callback_query_id: str,
+        text: Optional[str] = None,
+        show_alert: Optional[bool] = None,
+        url: Optional[str] = None,
+        cache_time: Optional[int] = None
+    ) -> bool:
+        """
+        Отвечает на callback-запрос от нажатия inline-кнопки.
+
+        :param callback_query_id: Уникальный идентификатор callback-запроса
+        :type callback_query_id: str
+
+        :param text: Текст всплывающего уведомления для пользователя (до 200 символов)
+        :type text: Optional[str]
+
+        :param show_alert: В Telegram показывает alert вместо уведомления.
+                           В MAX API не поддерживается, параметр принимается для совместимости
+        :type show_alert: Optional[bool]
+
+        :param url: В Telegram открывает URL. В MAX API не поддерживается,
+                    параметр принимается для совместимости
+        :type url: Optional[str]
+
+        :param cache_time: В Telegram задаёт время кэша. В MAX API не поддерживается,
+                           параметр принимается для совместимости
+        :type cache_time: Optional[int]
+
+        :return: True если запрос выполнен успешно
+        :rtype: bool
+        """
+        response = self.api.answer_callback(
+            callback_id=callback_query_id,
+            notification=text
+        )
+        return bool(response.get("success", False))
+
+    def answer_inline_query(
+        self,
+        inline_query_id: str,
+        results: List[Any],
+        cache_time: Optional[int] = None,
+        is_personal: Optional[bool] = None,
+        next_offset: Optional[str] = None,
+        switch_pm_text: Optional[str] = None,
+        switch_pm_parameter: Optional[str] = None,
+        button: Optional[Any] = None
+    ) -> bool:
+        """
+        Заглушка для совместимости с telebot: сигнатура один в один с
+        telebot.answer_inline_query, но вызов всегда бросает
+        NotImplementedError.
+
+        Инлайн-режима (@имя_бота запрос в поле ввода любого чата) в MAX
+        Bot API не существует: нет ни метода ответа, ни типа обновления
+        inline_query, поэтому реализовать метод на стороне MAX невозможно.
+        Заглушка нужна, чтобы перенесённый с telebot код падал с понятным
+        объяснением, а не с AttributeError.
+
+        Альтернативы в MAX: inline-клавиатуры (InlineKeyboardMarkup) и
+        reply-клавиатуры (ReplyKeyboardMarkup) на сообщениях бота.
+
+        :param inline_query_id: Идентификатор inline-запроса (в MAX не бывает)
+        :type inline_query_id: str
+
+        :param results: Список результатов inline-запроса
+        :type results: List[Any]
+
+        :param cache_time: Параметр telebot, в MAX не применим
+        :type cache_time: Optional[int]
+
+        :param is_personal: Параметр telebot, в MAX не применим
+        :type is_personal: Optional[bool]
+
+        :param next_offset: Параметр telebot, в MAX не применим
+        :type next_offset: Optional[str]
+
+        :param switch_pm_text: Параметр telebot, в MAX не применим
+        :type switch_pm_text: Optional[str]
+
+        :param switch_pm_parameter: Параметр telebot, в MAX не применим
+        :type switch_pm_parameter: Optional[str]
+
+        :param button: Параметр telebot, в MAX не применим
+        :type button: Optional[Any]
+
+        :raises NotImplementedError: всегда — инлайн-режима в MAX Bot API нет
+        """
+        raise NotImplementedError(
+            "Инлайн-режим не поддерживается MAX Bot API: у MAX нет ни метода "
+            "ответа на inline-запрос, ни самого типа обновления inline_query. "
+            "Используйте inline-клавиатуры (InlineKeyboardMarkup) или "
+            "reply-клавиатуры (ReplyKeyboardMarkup)."
+        )
+
+    @staticmethod
+    def _warn_inline_handler_unsupported(handler: Callable):
+        """
+        Пишет в лог предупреждение о регистрации inline-обработчика,
+        который в MAX никогда не будет вызван.
+        """
+        name = getattr(handler, "__name__", repr(handler))
+        logger.warning(
+            "Обработчик %s зарегистрирован, но никогда не будет вызван: "
+            "инлайн-режима в MAX Bot API нет (обновления inline_query "
+            "не существуют)", name
+        )
+
+    def inline_handler(self, func, **kwargs):
+        """
+        Заглушка для совместимости с telebot: сигнатура один в один с
+        telebot.inline_handler, но зарегистрированный обработчик никогда
+        не будет вызван — инлайн-режима (обновления inline_query) в MAX
+        Bot API нет.
+
+        Регистрация намеренно НЕ роняет бота: перенесённый с telebot код
+        с @bot.inline_handler(...) запускается, остальные обработчики
+        работают, а в лог пишется предупреждение. Прямой вызов
+        answer_inline_query, наоборот, бросает NotImplementedError.
+
+        :param func: Функция-фильтр (в MAX не применяется)
+        :type func: Callable
+
+        :param kwargs: Дополнительные фильтры telebot (игнорируются)
+
+        :return: Декоратор, возвращающий функцию без изменений
+        """
+        def decorator(handler):
+            self._warn_inline_handler_unsupported(handler)
+            return handler
+
+        return decorator
+
+    def register_inline_handler(self, callback: Callable, func: Callable, pass_bot: Optional[bool] = False, **kwargs):
+        """
+        Заглушка для совместимости с telebot: сигнатура один в один с
+        telebot.register_inline_handler. Обработчик никогда не будет
+        вызван — инлайн-режима в MAX Bot API нет; в лог пишется
+        предупреждение. См. inline_handler.
+
+        :param callback: Функция-обработчик (в MAX не будет вызвана)
+        :type callback: Callable
+
+        :param func: Функция-фильтр (в MAX не применяется)
+        :type func: Callable
+
+        :param pass_bot: Параметр telebot, в MAX не применим
+        :type pass_bot: Optional[bool]
+
+        :param kwargs: Дополнительные фильтры telebot (игнорируются)
+        """
+        self._warn_inline_handler_unsupported(callback)
+
+    def chosen_inline_handler(self, func, **kwargs):
+        """
+        Заглушка для совместимости с telebot: сигнатура один в один с
+        telebot.chosen_inline_handler. Обработчик никогда не будет
+        вызван — инлайн-режима (обновления chosen_inline_result) в MAX
+        Bot API нет; в лог пишется предупреждение. См. inline_handler.
+
+        :param func: Функция-фильтр (в MAX не применяется)
+        :type func: Callable
+
+        :param kwargs: Дополнительные фильтры telebot (игнорируются)
+
+        :return: Декоратор, возвращающий функцию без изменений
+        """
+        def decorator(handler):
+            self._warn_inline_handler_unsupported(handler)
+            return handler
+
+        return decorator
+
+    def register_chosen_inline_handler(self, callback: Callable, func: Callable, pass_bot: Optional[bool] = False, **kwargs):
+        """
+        Заглушка для совместимости с telebot: сигнатура один в один с
+        telebot.register_chosen_inline_handler. Обработчик никогда не
+        будет вызван — инлайн-режима в MAX Bot API нет; в лог пишется
+        предупреждение. См. inline_handler.
+
+        :param callback: Функция-обработчик (в MAX не будет вызвана)
+        :type callback: Callable
+
+        :param func: Функция-фильтр (в MAX не применяется)
+        :type func: Callable
+
+        :param pass_bot: Параметр telebot, в MAX не применим
+        :type pass_bot: Optional[bool]
+
+        :param kwargs: Дополнительные фильтры telebot (игнорируются)
+        """
+        self._warn_inline_handler_unsupported(callback)

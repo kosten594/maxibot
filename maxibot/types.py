@@ -1,9 +1,14 @@
 # from dataclasses import dataclass
+import logging
+import traceback
 from datetime import datetime
+from urllib.parse import urlsplit
 from typing import List, Dict, Any, Optional
 
 from maxibot.apihelper import Api
 from maxibot.util import is_pil_image, pil_image_to_bytes
+
+logger = logging.getLogger("maxibot")
 
 
 class JsonDeserializable(object):
@@ -17,20 +22,120 @@ class JsonDeserializable(object):
 
 class UpdateType:
     """
-    Типы обновлений, которые можно получать от MAX API
+    Типы обновлений, которые можно получать от MAX API (объект Update в
+    документации; тот же список строк — maxibot.util.update_types)
     """
     MESSAGE_CREATED = "message_created"
     MESSAGE_CALLBACK = "message_callback"
-    BOT_STARTED = "bot_started"
     MESSAGE_EDITED = "message_edited"
-    MESSAGE_DELETED = "message_deleted"
-    MESSAGE_CHAT_CREATED = "message_chat_created"
+    MESSAGE_REMOVED = "message_removed"
+    MESSAGE_DELETED = MESSAGE_REMOVED  # прежнее имя: "message_deleted" MAX не присылает
+    BOT_STARTED = "bot_started"
+    BOT_STOPPED = "bot_stopped"
     BOT_ADDED = "bot_added"
+    BOT_REMOVED = "bot_removed"
+    USER_ADDED = "user_added"
+    USER_REMOVED = "user_removed"
+    CHAT_TITLE_CHANGED = "chat_title_changed"
+    DIALOG_CLEARED = "dialog_cleared"
+    DIALOG_MUTED = "dialog_muted"
+    DIALOG_UNMUTED = "dialog_unmuted"
+    DIALOG_REMOVED = "dialog_removed"
+    COMMENT_CREATED = "comment_created"
+    COMMENT_EDITED = "comment_edited"
+    COMMENT_REMOVED = "comment_removed"
+    MESSAGE_CHAT_CREATED = "message_chat_created"  # в текущей документации MAX такого обновления нет
+
+
+class WebAppInfo:
+    """
+    Мини-приложение для кнопки InlineKeyboardButton(web_app=...).
+    Сигнатура как у telebot.types.WebAppInfo(url).
+
+    В Telegram web_app открывает произвольную страницу по URL. В MAX кнопка
+    open_app открывает мини-приложение бота, а адрес самого приложения
+    задаётся в настройках бота. Поэтому url здесь — публичное имя
+    (username) бота или ссылка на него (https://max.ru/<username>), чьё
+    мини-приложение надо открыть; это поле web_app кнопки open_app.
+
+    Пример, один в один с telebot:
+
+        markup.add(InlineKeyboardButton("Открыть", web_app=WebAppInfo("https://max.ru/mybot")))
+
+    :param url: Публичное имя (username) бота (ведущий @ отбрасывается)
+        или ссылка на него — поле web_app кнопки open_app. None допустим,
+        если задан contact_id. Адрес самого приложения сюда не подходит:
+        для такого url будет предупреждение в лог
+    :type url: Optional[str]
+
+    :param contact_id: ID бота, чьё мини-приложение надо открыть — поле
+        contact_id кнопки open_app (только в MAX)
+    :type contact_id: Optional[int]
+
+    :param payload: Параметр запуска, который попадёт в initData
+        мини-приложения — поле payload кнопки open_app (только в MAX)
+    :type payload: Optional[str]
+    """
+
+    def __init__(
+            self,
+            url: Optional[str],
+            contact_id: Optional[int] = None,
+            payload: Optional[str] = None,
+    ):
+        if isinstance(url, str) and url.startswith("@"):
+            url = url[1:]  # telebot-привычка: @username
+        self.url = url
+        self.contact_id = contact_id
+        self.payload = payload
+
+        if not url and contact_id is None:
+            raise ValueError("нужен url (username или ссылка на бота) или contact_id")
+        if url:
+            parts = urlsplit(url)
+            host = (parts.hostname or "").lower()
+            if parts.scheme in ("http", "https") and \
+                    host != "max.ru" and not host.endswith(".max.ru"):
+                logger.warning(
+                    "WebAppInfo(%r): в MAX кнопка open_app открывает мини-приложение "
+                    "бота, настроенное на dev.max.ru, — url должен быть username бота "
+                    "или https://max.ru/<username>, а не адрес приложения, как в Telegram",
+                    url,
+                )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Поля кнопки open_app для MAX API: web_app, contact_id, payload.
+        Незаданные поля в словарь не попадают
+
+        :return: Словарь с полями кнопки open_app
+        :rtype: Dict[str, Any]
+        """
+        result: Dict[str, Any] = {}
+        if self.url:
+            result["web_app"] = self.url
+        if self.contact_id is not None:
+            result["contact_id"] = self.contact_id
+        if self.payload is not None:
+            result["payload"] = self.payload
+        return result
 
 
 class InlineKeyboardButton:
     """
-    Класс для создания inline-кнопок в сообщениях
+    Класс для создания inline-кнопок в сообщениях. Сигнатура один в один
+    с telebot.InlineKeyboardButton: text, url, callback_data, web_app.
+
+    Кнопка должна быть ровно одного вида:
+
+    * url — {"type": "link"}: открывает ссылку;
+    * callback_data — {"type": "callback"}: по нажатию бот получает
+      message_callback с этими данными (callback_query_handler);
+    * web_app — {"type": "open_app"}: открывает мини-приложение бота,
+      см. WebAppInfo.
+
+    Кнопки link и open_app — специальные: в ряду с ними не больше
+    3 кнопок (у обычных — 7).
 
     :param text: Текст на кнопке
     :type text: str
@@ -40,6 +145,38 @@ class InlineKeyboardButton:
 
     :param callback_data: Данные для callback-кнопки
     :type callback_data: Optional[str]
+
+    :param web_app: Мини-приложение для кнопки типа "open_app": WebAppInfo
+        или строка — username бота или ссылка на него
+    :type web_app: Optional[WebAppInfo]
+
+    Параметры telebot без аналога в MAX (switch_inline_query, callback_game,
+    pay, login_url и т.п.) принимаются и игнорируются, но кнопка только
+    с таким параметром не собирается — ValueError с его именем.
+
+    :param switch_inline_query: Принимается для совместимости с telebot и
+        игнорируется — inline-режима в MAX нет
+    :type switch_inline_query: Optional[Any]
+
+    :param switch_inline_query_current_chat: Принимается для совместимости
+        с telebot и игнорируется
+    :type switch_inline_query_current_chat: Optional[Any]
+
+    :param switch_inline_query_chosen_chat: Принимается для совместимости
+        с telebot и игнорируется
+    :type switch_inline_query_chosen_chat: Optional[Any]
+
+    :param callback_game: Принимается для совместимости с telebot и
+        игнорируется — игр в MAX нет
+    :type callback_game: Optional[Any]
+
+    :param pay: Принимается для совместимости с telebot и игнорируется —
+        платежей в MAX Bot API нет
+    :type pay: Optional[Any]
+
+    :param login_url: Принимается для совместимости с telebot и
+        игнорируется
+    :type login_url: Optional[Any]
     """
     MAX_URL_LEN = 2048
 
@@ -47,16 +184,49 @@ class InlineKeyboardButton:
             self,
             text: str,
             url: Optional[str] = None,
-            callback_data: Optional[str] = None
+            callback_data: Optional[str] = None,
+            web_app: Optional[WebAppInfo] = None,
+            switch_inline_query: Optional[Any] = None,
+            switch_inline_query_current_chat: Optional[Any] = None,
+            switch_inline_query_chosen_chat: Optional[Any] = None,
+            callback_game: Optional[Any] = None,
+            pay: Optional[Any] = None,
+            login_url: Optional[Any] = None,
     ):
+        if isinstance(web_app, str) and web_app:
+            web_app = WebAppInfo(web_app)
+        elif web_app is not None and not isinstance(web_app, WebAppInfo):
+            telebot_url = getattr(web_app, "url", None)  # telebot.types.WebAppInfo
+            if isinstance(telebot_url, str) and telebot_url:
+                web_app = WebAppInfo(telebot_url)
         self.text = text
         self.url = url
         self.callback_data = callback_data
+        self.web_app = web_app
+        self.switch_inline_query = switch_inline_query
+        self.switch_inline_query_current_chat = switch_inline_query_current_chat
+        self.switch_inline_query_chosen_chat = switch_inline_query_chosen_chat
+        self.callback_game = callback_game
+        self.pay = pay
+        self.login_url = login_url
 
-        # if not (url or callback_data):
-        #     raise ValueError("url или callback_data обязан быть")
-        if url and callback_data:
-            raise ValueError("укажите что-то одно")
+        kinds = [name for name, value in (("url", url), ("callback_data", callback_data), ("web_app", web_app)) if value]
+        if not kinds:
+            telebot_only = [name for name, value in (
+                ("switch_inline_query", switch_inline_query),
+                ("switch_inline_query_current_chat", switch_inline_query_current_chat),
+                ("switch_inline_query_chosen_chat", switch_inline_query_chosen_chat),
+                ("callback_game", callback_game),
+                ("pay", pay),
+                ("login_url", login_url),
+            ) if value is not None]
+            if telebot_only:
+                raise ValueError(
+                    f"кнопка только с {', '.join(telebot_only)}: аналога в MAX нет "
+                    f"(inline-режима, игр и платежей нет) — нужен url, callback_data или web_app")
+            raise ValueError("url, callback_data или web_app обязан быть")
+        if len(kinds) > 1:
+            raise ValueError(f"укажите что-то одно: {' и '.join(kinds)}")
         if url and len(url) > self.MAX_URL_LEN:
             raise ValueError(f"url не может быть длиннее {self.MAX_URL_LEN} символов")
 
@@ -69,6 +239,8 @@ class InlineKeyboardButton:
         """
         if self.url:
             return {"type": "link", "text": self.text, "url": self.url}
+        if self.web_app:
+            return {"type": "open_app", "text": self.text, **self.web_app.to_dict()}
         return {
             "type": "callback",
             "text": self.text,
@@ -79,10 +251,10 @@ class InlineKeyboardButton:
         """
         Проверяет, является ли кнопка специальной (ограничивает ряд до 3 кнопок)
 
-        :return: True если кнопка специальная (link), False если обычная (callback)
+        :return: True если кнопка link или open_app, False если обычная (callback)
         :rtype: bool
         """
-        return self.url is not None  # link
+        return bool(self.url or self.web_app)
 
 
 class InlineKeyboardButtonRequestContact:
@@ -110,7 +282,7 @@ class InlineKeyboardButtonRequestContact:
         """
         Проверяет, является ли кнопка специальной (ограничивает ряд до 3 кнопок)
 
-        :return: True если кнопка специальная (link), False если обычная (callback)
+        :return: True если кнопка link или open_app, False если обычная (callback)
         :rtype: bool
         """
         return False
@@ -150,9 +322,15 @@ class InlineKeyboardButtonOpenApp:
 
 class InlineKeyboardMarkup:
     """
-    Класс для создания inline-клавиатур в сообщениях
+    Класс для создания inline-клавиатур в сообщениях. Сигнатура один
+    в один с telebot.InlineKeyboardMarkup: (keyboard=None, row_width=3).
 
-    :param row_width: Ширина ряда по умолчанию (сколько кнопок в ряду)
+    :param keyboard: Готовая клавиатура — список рядов кнопок
+        InlineKeyboardButton
+    :type keyboard: Optional[List[List[InlineKeyboardButton]]]
+
+    :param row_width: Ширина ряда по умолчанию для add()
+        (сколько кнопок в ряду), как в telebot — 3
     :type row_width: int
     """
     MAX_ROWS = 30
@@ -160,9 +338,13 @@ class InlineKeyboardMarkup:
     MAX_ROW_REGULAR = 7
     MAX_ROW_SPECIAL = 3
 
-    def __init__(self, row_width: int = 1):
+    def __init__(
+            self,
+            keyboard: Optional[List[List[InlineKeyboardButton]]] = None,
+            row_width: int = 3,
+    ):
         self.row_width = row_width
-        self.keyboard: List[List[InlineKeyboardButton]] = []
+        self.keyboard: List[List[InlineKeyboardButton]] = keyboard if keyboard else []
 
     def add(self, *args: InlineKeyboardButton, row_width=None) -> 'InlineKeyboardMarkup':
         """
@@ -240,10 +422,227 @@ class InlineKeyboardMarkup:
             special_in_row = any(btn.is_special() for btn in row)
             limit = self.MAX_ROW_SPECIAL if special_in_row else self.MAX_ROW_REGULAR
             if len(row) > limit:
-                raise ValueError(
-                    f"Ряд содержит {len(row)} кнопок, но максимум {limit} "
-                    f"(из-за special-кнопок)" if special_in_row else ""
-                )
+                reason = " (в ряду есть кнопка link, open_app, request_contact или request_geo_location)" \
+                    if special_in_row else ""
+                raise ValueError(f"Ряд содержит {len(row)} кнопок, но максимум {limit}{reason}")
+
+
+class KeyboardButton:
+    """
+    Кнопка reply-клавиатуры. Сигнатура один в один с telebot.KeyboardButton.
+
+    В MAX нет системной reply-клавиатуры, поэтому кнопка превращается
+    в кнопку inline-клавиатуры:
+
+    * обычная текстовая — {"type": "message"}: по нажатию отправляет
+      текст кнопки в чат, как reply-кнопка в Telegram;
+    * request_contact=True — {"type": "request_contact"}: запрашивает
+      контакт и номер телефона пользователя;
+    * request_location=True — {"type": "request_geo_location"}:
+      запрашивает местоположение пользователя;
+    * web_app=WebAppInfo(...) — {"type": "open_app"}: открывает
+      мини-приложение бота, как в telebot (см. WebAppInfo).
+
+    Приоритет, если задано несколько: request_contact, затем
+    request_location, затем web_app.
+
+    :param text: Текст кнопки (у обычной кнопки он же отправляется в чат)
+    :type text: str
+
+    :param request_contact: Если True, по нажатию бот получит контакт
+        пользователя
+    :type request_contact: Optional[bool]
+
+    :param request_location: Если True, по нажатию бот получит
+        местоположение пользователя
+    :type request_location: Optional[bool]
+
+    :param request_poll: Принимается для совместимости с telebot и
+        игнорируется — опросов в MAX Bot API нет, кнопка станет обычной
+        текстовой
+    :type request_poll: Optional[Any]
+
+    :param web_app: WebAppInfo или строка (username бота или ссылка
+        на него) — кнопка станет кнопкой open_app и откроет
+        мини-приложение бота, как в telebot. Другие значения
+        принимаются для совместимости и игнорируются — кнопка
+        останется обычной текстовой
+    :type web_app: Optional[Any]
+
+    :param request_user: Принимается для совместимости с telebot и
+        игнорируется
+    :type request_user: Optional[Any]
+
+    :param request_chat: Принимается для совместимости с telebot и
+        игнорируется
+    :type request_chat: Optional[Any]
+
+    :param request_users: Принимается для совместимости с telebot и
+        игнорируется
+    :type request_users: Optional[Any]
+    """
+
+    def __init__(
+            self,
+            text: str,
+            request_contact: Optional[bool] = None,
+            request_location: Optional[bool] = None,
+            request_poll: Optional[Any] = None,
+            web_app: Optional[Any] = None,
+            request_user: Optional[Any] = None,
+            request_chat: Optional[Any] = None,
+            request_users: Optional[Any] = None,
+    ):
+        if isinstance(web_app, str) and web_app:
+            web_app = WebAppInfo(web_app)
+        elif web_app is not None and not isinstance(web_app, WebAppInfo):
+            telebot_url = getattr(web_app, "url", None)  # telebot.types.WebAppInfo
+            if isinstance(telebot_url, str) and telebot_url:
+                web_app = WebAppInfo(telebot_url)
+        self.text = text
+        self.request_contact = request_contact
+        self.request_location = request_location
+        self.request_poll = request_poll
+        self.web_app = web_app
+        self.request_user = request_user
+        self.request_chat = request_chat
+        self.request_users = request_users
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Преобразует кнопку в словарь для отправки в MAX API
+
+        :return: Словарь с данными кнопки в формате MAX API
+        :rtype: Dict[str, Any]
+        """
+        if self.request_contact:
+            return {"type": "request_contact", "text": self.text}
+        if self.request_location:
+            return {"type": "request_geo_location", "text": self.text}
+        if isinstance(self.web_app, WebAppInfo):
+            return {"type": "open_app", "text": self.text, **self.web_app.to_dict()}
+        return {"type": "message", "text": self.text}
+
+    def is_special(self) -> bool:
+        """
+        Проверяет, является ли кнопка специальной (ограничивает ряд до 3 кнопок)
+
+        :return: True если кнопка запрашивает контакт или местоположение
+            либо открывает мини-приложение
+        :rtype: bool
+        """
+        return bool(self.request_contact or self.request_location
+                    or isinstance(self.web_app, WebAppInfo))
+
+
+class ReplyKeyboardMarkup(InlineKeyboardMarkup):
+    """
+    Reply-клавиатура. Сигнатура один в один с telebot.ReplyKeyboardMarkup:
+    add() и row() принимают строки, bytes и KeyboardButton.
+
+    В MAX нет системной reply-клавиатуры, поэтому она отправляется как
+    inline-клавиатура с кнопками типа "message" — по нажатию текст кнопки
+    уходит в чат, и бот получает его обычным сообщением, как в Telegram.
+    Клавиатура при этом прикреплена к сообщению, а не к полю ввода.
+
+    Пример, один в один с telebot:
+
+        markup = ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.add("Да", "Нет")
+        bot.send_message(chat_id, "Продолжаем?", reply_markup=markup)
+
+    :param resize_keyboard: Принимается для совместимости с telebot и
+        игнорируется — в MAX клавиатура прикреплена к сообщению, размер
+        задаёт клиент
+    :type resize_keyboard: Optional[bool]
+
+    :param one_time_keyboard: Принимается для совместимости с telebot и
+        игнорируется
+    :type one_time_keyboard: Optional[bool]
+
+    :param selective: Принимается для совместимости с telebot и
+        игнорируется
+    :type selective: Optional[bool]
+
+    :param row_width: Ширина ряда по умолчанию (сколько кнопок в ряду)
+    :type row_width: int
+
+    :param input_field_placeholder: Принимается для совместимости с
+        telebot и игнорируется — поля ввода с плейсхолдером в MAX нет
+    :type input_field_placeholder: Optional[str]
+
+    :param is_persistent: Принимается для совместимости с telebot и
+        игнорируется
+    :type is_persistent: Optional[bool]
+    """
+    max_row_keys = 12  # атрибут telebot, оставлен для совместимости
+
+    def __init__(
+            self,
+            resize_keyboard: Optional[bool] = None,
+            one_time_keyboard: Optional[bool] = None,
+            selective: Optional[bool] = None,
+            row_width: int = 3,
+            input_field_placeholder: Optional[str] = None,
+            is_persistent: Optional[bool] = None,
+    ):
+        super().__init__(row_width=row_width)
+        self.resize_keyboard = resize_keyboard
+        self.one_time_keyboard = one_time_keyboard
+        self.selective = selective
+        self.input_field_placeholder = input_field_placeholder
+        self.is_persistent = is_persistent
+
+    def add(self, *args, row_width=None) -> 'ReplyKeyboardMarkup':
+        """
+        Добавляет кнопки в клавиатуру, автоматически разбивая на ряды.
+        Как в telebot, кнопкой может быть строка, bytes или KeyboardButton.
+
+        :param args: Кнопки для добавления
+        :type args: Union[str, bytes, KeyboardButton]
+
+        :param row_width: Ширина ряда для этих кнопок (если не указано,
+            используется self.row_width)
+        :type row_width: Optional[int]
+
+        :return: Текущий объект клавиатуры (для цепочки вызовов)
+        :rtype: ReplyKeyboardMarkup
+        """
+        buttons = [self._normalize_button(button) for button in args]
+        super().add(*buttons, row_width=row_width)
+        return self
+
+    def row(self, *args) -> 'ReplyKeyboardMarkup':
+        """
+        Добавляет ряд кнопок в клавиатуру.
+        Как в telebot, кнопкой может быть строка, bytes или KeyboardButton.
+
+        :param args: Кнопки для добавления в ряд
+        :type args: Union[str, bytes, KeyboardButton]
+
+        :return: Текущий объект клавиатуры (для цепочки вызовов)
+        :rtype: ReplyKeyboardMarkup
+        """
+        buttons = [self._normalize_button(button) for button in args]
+        super().row(*buttons)
+        return self
+
+    @staticmethod
+    def _normalize_button(button) -> KeyboardButton:
+        """
+        Приводит строку/bytes к KeyboardButton (как это делает telebot)
+
+        :param button: Кнопка в любом поддерживаемом виде
+        :type button: Union[str, bytes, KeyboardButton]
+
+        :return: Объект кнопки
+        :rtype: KeyboardButton
+        """
+        if isinstance(button, KeyboardButton):
+            return button
+        if isinstance(button, bytes):
+            return KeyboardButton(button.decode("utf-8"))
+        return KeyboardButton(str(button))
 
 
 class ImagePayload(JsonDeserializable):
@@ -442,11 +841,13 @@ class InputMedia(JsonDeserializable):
     """
     Класс формирования объекта attachments для отправки медиа
 
-    :param type: Тип медиа (photo/file)
+    :param type: Тип медиа (photo/file/video)
     :type type: str
 
-    :param media: Байты медиа
-    :type media: bytes
+    :param media: Байты медиа; для фото — также строка: прямая
+        http(s)-ссылка на изображение (MAX скачает его сам) или токен
+        ранее загруженного изображения (аналог file_id)
+    :type media: Union[bytes, str]
 
     :param caption: Подпись к медиа
     :type caption: Optional[str]
@@ -456,7 +857,8 @@ class InputMedia(JsonDeserializable):
     """
     compare_types = {
         "photo": "image",
-        "file": "file"
+        "file": "file",
+        "video": "video"
     }
 
     def __init__(self, type: str = None, media: bytes = None, caption: str = None, parse_mode: str = None):
@@ -512,13 +914,27 @@ class InputMedia(JsonDeserializable):
         :rtype: Dict[str, Any]
         """
         self.api = api
-        upload_url = self._get_upload_url(type_attach=self.type).get("url")
+        if self.type == "photo" and isinstance(self.media, str):
+            # Строка — как в telebot: http(s)-ссылка или токен ранее
+            # загруженного изображения (аналог file_id, лежит в
+            # message.photo.payload.token). Оба варианта MAX принимает
+            # без POST /uploads, но только для изображений: видео, аудио
+            # и файлы MAX принимает исключительно токеном загрузки
+            if self.media.startswith(("http://", "https://")):
+                return {"type": "image", "payload": {"url": self.media}}
+            return {"type": "image", "payload": {"token": self.media}}
+        upload = self._get_upload_url(type_attach=self.type)
+        upload_url = upload.get("url")
         if not upload_url:
             return []
         if is_pil_image(self.media):
             self.media = pil_image_to_bytes(self.media)
         load_file_result = self._load_file_to_max(url=upload_url, file_name=file_name)
-        if file_name:
+        if self.type == "video":
+            # у видео (и аудио) MAX отдаёт token сразу в ответе POST /uploads,
+            # ответ самой загрузки файла токена не содержит
+            token_dict = {"token": upload.get("token")}
+        elif file_name:
             token_dict = {"token": load_file_result.get("token")}
         else:
             token_dict = list(list(load_file_result.values())[0].values())[0]
@@ -871,3 +1287,43 @@ class CallbackQuery:
         if 'notification' not in kwargs:
             kwargs['notification'] = "Обновлено!"
         return self.answer(text=text, **kwargs)
+
+
+class Update(JsonDeserializable):
+    """
+    Обновление от MAX API целиком (аналог telebot.types.Update). Его
+    получают middleware без update_types; в message, edited_message и
+    callback_query лежат те же объекты, которые затем попадут в
+    обработчики, поэтому атрибуты, выставленные на них в middleware,
+    видны и обработчикам. Как в telebot, заполнено только поле своего
+    типа обновления; сырой payload всегда доступен в json
+
+    :param update: Обновление от MAX API
+    :type update: Dict[str, Any]
+
+    :param api: Объект API
+    :type api: Api
+    """
+
+    def __init__(self, update: Dict[str, Any], api: Api):
+        self.json: Dict[str, Any] = update
+        self.update_type: Optional[str] = update.get("update_type")
+        self.timestamp: Optional[int] = update.get("timestamp")
+        self.message: Optional[Message] = None
+        self.edited_message: Optional[Message] = None
+        self.callback_query: Optional[CallbackQuery] = None
+        try:
+            if self.update_type in (UpdateType.BOT_STARTED, UpdateType.BOT_ADDED) or \
+                    self.update_type == UpdateType.MESSAGE_CREATED and "message" in update:
+                # bot_started и bot_added бот обрабатывает как сообщения
+                # (/start и появление в чате), поэтому они тоже в message
+                self.message = Message(update=update, api=api)
+            elif self.update_type == UpdateType.MESSAGE_EDITED and "message" in update:
+                self.edited_message = Message(update=update, api=api)
+            elif self.update_type == UpdateType.MESSAGE_CALLBACK and "callback" in update:
+                self.callback_query = CallbackQuery(update=update, api=api)
+        except Exception:
+            # payload, который парсер не понял (например, пост канала без
+            # sender): общие middleware всё равно получат Update с сырым json,
+            # а до обработчиков такое обновление не дойдёт — как и раньше
+            print(f"Error while parsing update {self.update_type}: {traceback.format_exc()}")
